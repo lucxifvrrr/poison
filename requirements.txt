@@ -1,0 +1,17 @@
+aiohttp
+aiosqlite
+backoff
+discord
+dotenv
+humanize
+matplotlib
+motor
+psutil
+pyfiglet
+pymongo
+pytz
+PyNaCl
+deep-translator>=1.11.4
+numpy>=1.20.0
+aiofiles>=0.8.0
+Pillow>=10.0.0
