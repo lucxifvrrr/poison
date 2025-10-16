@@ -188,13 +188,16 @@ If you want to use the quarantine and appeal system:
 ## ⚙️ Configuration
 
 ### Environment Variables
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `DISCORD_TOKEN` | Your Discord bot token | ✅ Yes |
-| `WEBHOOK_URL` | Webhook URL for error reporting | ✅ Yes |
-| `MONGO_URL` | MongoDB connection URL for quarantine/appeal system | ✅ Yes* |
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `DISCORD_TOKEN` | Your Discord bot token | ✅ Yes | - |
+| `WEBHOOK_URL` | Webhook URL for error reporting | ✅ Yes | - |
+| `MONGO_URL` | MongoDB connection URL for quarantine/appeal system | ✅ Yes* | - |
+| `AUTO_SYNC_COMMANDS` | Enable automatic command syncing | ❌ No | `true` |
 
 *Required only if using the quarantine/appeal system
+
+> 💡 **Automatic Command Sync**: The bot handles command syncing automatically with intelligent rate limit protection. See [AUTO_SYNC_README.md](AUTO_SYNC_README.md) for details.
 
 ### Bot Intents
 The bot requires the following intents:
@@ -224,7 +227,9 @@ The bot requires the following intents:
 
 ### Prefix Commands
 - `.ping` - Check bot latency and response time (Shows green dot status with ms)
-- `.sync` - Manually sync slash commands (Owner only)
+- `.sync` - Manually sync slash commands (Owner only) - Rarely needed, bot handles automatically
+- `.syncstatus` - Check command sync status with detailed info (Owner only)
+- `.reload [cog]` - Reload cogs without restarting (Owner only) - Use this instead of restarting!
 
 ### Slash Commands
 The bot includes numerous slash commands across all cogs. Use `/` in Discord to see all available commands with descriptions.
@@ -291,7 +296,7 @@ The bot uses a modular architecture where each feature is implemented as a separ
 | 🛑 **Graceful Shutdown** | Proper cleanup on exit with signal handlers |
 | 🧹 **Periodic Resource Cleanup** | Automatic memory management every 5 minutes |
 | 📝 **Rotating Log Files** | Automatic log rotation with 7-day retention |
-| 🔄 **Smart Command Sync** | Efficient command sync with rate limit handling and caching |
+| 🔄 **Automatic Command Sync** | Fully automatic sync with rate limit protection, exponential backoff, and self-healing recovery |
 | 🎨 **Pretty Terminal Output** | Colorful terminal display with command listing and status |
 
 ## 🛠️ Development

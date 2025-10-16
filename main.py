@@ -15,12 +15,15 @@ import time
 from logging import StreamHandler
 import json
 import hashlib
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # Load environment variables
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+MONGO_URL = os.getenv("MONGO_URL")
+AUTO_SYNC_COMMANDS = os.getenv("AUTO_SYNC_COMMANDS", "true").lower() == "true"
 
 # Directory constants
 LOGS_DIR = "logs"
@@ -82,7 +85,7 @@ class DiscordBot(commands.Bot):
         intents.presences = True
         intents.message_content = True
 
-        super().__init__(command_prefix=".", intents=intents)
+        super().__init__(command_prefix=",", intents=intents)
         self.session: Optional[aiohttp.ClientSession] = None
         self._ready_once = False
         self._synced_commands: List[discord.app_commands.Command] = []
@@ -92,12 +95,36 @@ class DiscordBot(commands.Bot):
         # Add logger for cogs to use
         self.logger = logging.getLogger('discord.bot')
         
+        # Shared MongoDB connection for all cogs
+        self.mongo_client: Optional[AsyncIOMotorClient] = None
+        if MONGO_URL:
+            try:
+                self.mongo_client = AsyncIOMotorClient(
+                    MONGO_URL,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=10000,
+                    socketTimeoutMS=45000,
+                    maxPoolSize=50,
+                    minPoolSize=5,
+                    maxIdleTimeMS=45000,
+                    retryWrites=True,
+                    retryReads=True
+                )
+                logging.info("Shared MongoDB connection initialized")
+            except Exception as e:
+                logging.warning(f"Failed to initialize shared MongoDB connection: {e}")
+                self.mongo_client = None
+        
         # Global cooldown mapping
         self._cd_mapping = commands.CooldownMapping.from_cooldown(1, 0.2, commands.BucketType.user)
         
         # Response tracking to prevent duplicates
         self._response_tracker: Set[str] = set()
         self._tracker_cleanup_time = time.time()
+        self._sync_lock = asyncio.Lock()
+        self._rate_limit_count = 0
+        self._auto_sync_task: Optional[asyncio.Task] = None
+        self._last_sync_attempt = 0
 
         # Prefix commands
         @self.command()
@@ -108,16 +135,28 @@ class DiscordBot(commands.Bot):
         @commands.is_owner()
         async def sync(ctx):
             """Manually sync slash commands (owner only)"""
+            msg = await ctx.send("<a:heartspark_ogs:1427918324066422834> Syncing commands...")
             try:
-                msg = await ctx.send("⏳ Syncing commands...")
-                synced = await self.tree.sync()
-                current_hash = self._get_command_hash()
-                self._save_sync_cache(current_hash, time.time())
-                await msg.edit(content=f"✅ Successfully synced {len(synced)} commands!")
-                logging.info(f"Manual sync triggered by {ctx.author}")
+                async with self._sync_lock:
+                    synced = await self.tree.sync()
+                    current_hash = self._get_command_hash()
+                    # Reset rate limit counter on successful manual sync
+                    self._rate_limit_count = 0
+                    self._save_sync_cache(current_hash, time.time(), rate_limited=False, retry_after=None)
+                    await msg.edit(content=f"<a:white_tick:1426439810733572136> Successfully synced {len(synced)} commands!")
+                    logging.info(f"Manual sync triggered by {ctx.author}")
             except HTTPException as e:
                 if e.status == 429:
-                    await msg.edit(content="❌ Rate limited! Please wait before syncing again.")
+                    self._rate_limit_count += 1
+                    retry_after = e.response.headers.get('Retry-After', 'unknown')
+                    backoff_hours = min(2 ** self._rate_limit_count, 24)
+                    self._save_sync_cache(self._get_command_hash(), time.time(), rate_limited=True, retry_after=retry_after)
+                    await msg.edit(
+                        content=f"❌ Rate limited! Discord says wait {retry_after}s. "
+                        f"Bot will wait {backoff_hours}h before auto-sync. "
+                        f"**Stop restarting the bot!**"
+                    )
+                    logging.error(f"Manual sync rate limited by {ctx.author}")
                 else:
                     await msg.edit(content=f"❌ Sync failed: {e}")
             except Exception as e:
@@ -125,19 +164,82 @@ class DiscordBot(commands.Bot):
         
         @self.command()
         @commands.is_owner()
-        async def reload(ctx, cog: str = None):
+        async def cogs(ctx):
+            """List all loaded cogs (owner only)"""
+            if not self.extensions:
+                await ctx.send("No cogs loaded.")
+                return
+            
+            cog_list = "\n".join(f"  • `{ext}`" for ext in sorted(self.extensions.keys()))
+            await ctx.send(f"**Loaded Cogs ({len(self.extensions)}):**\n{cog_list}")
+        
+        @self.command()
+        @commands.is_owner()
+        async def reload(ctx, *, cog: str = None):
             """Reload a cog or all cogs (owner only)"""
-            msg = await ctx.send("⏳ Reloading...")
+            msg = await ctx.send("<a:reddot:1427539828521697282> Reloading...")
             
             if cog:
-                # Reload specific cog
+                # Reload specific cog - support both folder names and full module paths
+                extensions_to_reload = []
+                
+                # Check if it's a full module path (e.g., cogs.counting.counting)
+                if cog in self.extensions:
+                    extensions_to_reload.append(cog)
+                else:
+                    # Try to find extensions matching the folder/cog name
+                    # Support formats: "counting", "cogs.counting", etc.
+                    search_term = cog.replace("cogs.", "").strip().lower()
+                    
+                    for ext in self.extensions.keys():
+                        # Match if the search term is in the extension path
+                        # Examples: "counting" matches "cogs.counting.counting"
+                        #           "giveaways" matches "cogs.giveaways.giveaway_admin"
+                        ext_lower = ext.lower()
+                        ext_parts = ext_lower.split('.')
+                        
+                        # Check if search term matches any part of the module path
+                        if search_term in ext_parts:
+                            extensions_to_reload.append(ext)
+                        # Also check if it's a substring match (for partial names)
+                        elif any(search_term in part for part in ext_parts):
+                            extensions_to_reload.append(ext)
+                
+                if not extensions_to_reload:
+                    # Show available cogs to help user
+                    available = "\n".join(f"  • `{ext}`" for ext in sorted(self.extensions.keys())[:10])
+                    try:
+                        await msg.edit(content=f"<:ogs_bell:1427918360401940552> No cog found matching `{cog}`\n\n**Available cogs:**\n{available}")
+                    except discord.NotFound:
+                        await ctx.send(f"<:ogs_bell:1427918360401940552> No cog found matching `{cog}`\n\n**Available cogs:**\n{available}")
+                    return
+                
+                # Reload all matching extensions
+                success = []
+                failed = []
+                
+                for ext in extensions_to_reload:
+                    try:
+                        await self.reload_extension(ext)
+                        success.append(ext)
+                        logging.info(f"Cog reloaded by {ctx.author}: {ext}")
+                    except Exception as e:
+                        failed.append(f"{ext}: {str(e)[:50]}")
+                        logging.error(f"Failed to reload cog {ext}: {e}")
+                
+                # Build response message
+                if success and not failed:
+                    result = f"<a:white_tick:1426439810733572136> Successfully reloaded:\n" + "\n".join(f"  • `{s}`" for s in success) + ""
+                elif success and failed:
+                    result = f"<a:white_tick:1426439810733572136> Reloaded {len(success)}:\n" + "\n".join(f"  • `{s}`" for s in success)
+                    result += f"\n<:ogs_bell:1427918360401940552> Failed {len(failed)}:\n" + "\n".join(f"  • {f}" for f in failed[:3])
+                else:
+                    result = f"<:ogs_bell:1427918360401940552> Failed to reload:\n" + "\n".join(f"  • {f}" for f in failed[:3])
+                
                 try:
-                    await self.reload_extension(cog)
-                    await msg.edit(content=f"✅ Successfully reloaded `{cog}`\n💡 Config changes applied!")
-                    logging.info(f"Cog reloaded by {ctx.author}: {cog}")
-                except Exception as e:
-                    await msg.edit(content=f"❌ Failed to reload `{cog}`: {e}")
-                    logging.error(f"Failed to reload cog {cog}: {e}")
+                    await msg.edit(content=result)
+                except discord.NotFound:
+                    await ctx.send(content=result)
             else:
                 # Reload all cogs
                 success = []
@@ -151,12 +253,89 @@ class DiscordBot(commands.Bot):
                         failed.append(f"{extension}: {str(e)[:50]}")
                         logging.error(f"Failed to reload {extension}: {e}")
                 
-                result = f"✅ Reloaded {len(success)} cog(s)\n💡 Config changes applied!"
+                result = f"<a:white_tick:1426439810733572136> Reloaded {len(success)} cog(s)"
                 if failed:
-                    result += f"\n❌ Failed: {len(failed)}\n" + "\n".join(f"  • {f}" for f in failed[:5])
+                    result += f"\n<:ogs_bell:1427918360401940552> Failed: {len(failed)}\n" + "\n".join(f"  • {f}" for f in failed[:5])
                 
-                await msg.edit(content=result)
+                try:
+                    await msg.edit(content=result)
+                except discord.NotFound:
+                    await ctx.send(content=result)
                 logging.info(f"All cogs reloaded by {ctx.author}: {len(success)} success, {len(failed)} failed")
+        
+        @self.command()
+        @commands.is_owner()
+        async def syncstatus(ctx):
+            """Check command sync status (owner only)"""
+            cache = self._load_sync_cache()
+            last_sync = cache.get('last_sync', 0)
+            was_rate_limited = cache.get('rate_limited', False)
+            rate_limit_count = cache.get('rate_limit_count', 0)
+            retry_after = cache.get('retry_after', 'N/A')
+            
+            current_time = time.time()
+            time_since_sync = current_time - last_sync
+            
+            # Format time
+            if last_sync > 0:
+                hours_ago = int(time_since_sync) // 3600
+                minutes_ago = (int(time_since_sync) % 3600) // 60
+                last_sync_str = f"{hours_ago}h {minutes_ago}m ago"
+            else:
+                last_sync_str = "Never"
+            
+            # Calculate next sync time
+            if was_rate_limited:
+                rate_limit_backoff = min(3600 * (2 ** rate_limit_count), 86400)
+                time_remaining = rate_limit_backoff - time_since_sync
+                if time_remaining > 0:
+                    hours = int(time_remaining) // 3600
+                    minutes = (int(time_remaining) % 3600) // 60
+                    next_sync = f"{hours}h {minutes}m (auto-retry)"
+                    status_emoji = "<:ogs_info:1427918257226121288>"
+                    status_text = "Rate Limited"
+                else:
+                    next_sync = "Ready to sync"
+                    status_emoji = "✅"
+                    status_text = "Recovered"
+            else:
+                # Check if we're in the minimum interval
+                min_sync_interval = 3600  # 1 hour
+                if time_since_sync < min_sync_interval:
+                    time_remaining = min_sync_interval - time_since_sync
+                    minutes = int(time_remaining) // 60
+                    next_sync = f"In {minutes}m (cooldown)"
+                    status_emoji = "⏳"
+                    status_text = "Cooldown"
+                else:
+                    status_emoji = "✅"
+                    status_text = "Normal"
+                    next_sync = "On command change or 24h"
+            
+            embed = discord.Embed(
+                title=f"{status_emoji} Command Sync Status",
+                color=discord.Color.orange() if was_rate_limited else (discord.Color.blue() if status_text == "Cooldown" else discord.Color.green()),
+                timestamp=discord.utils.utcnow()
+            )
+            embed.add_field(name="Status", value=status_text, inline=True)
+            embed.add_field(name="Total Commands", value=len(self._synced_commands), inline=True)
+            embed.add_field(name="Rate Limit Count", value=rate_limit_count, inline=True)
+            embed.add_field(name="Last Sync", value=last_sync_str, inline=True)
+            embed.add_field(name="Next Sync", value=next_sync, inline=True)
+            embed.add_field(name="Discord Retry-After", value=f"{retry_after}s" if retry_after != 'N/A' else 'N/A', inline=True)
+            
+            # Add helpful tips
+            tips = []
+            if was_rate_limited:
+                tips.append("⚠️ **Rate Limited**: Wait for auto-retry, don't restart!")
+            elif status_text == "Cooldown":
+                tips.append("⏳ **Cooldown Active**: Bot prevents syncing too frequently")
+            tips.append("💡 Use `.reload` to reload cogs without restarting")
+            
+            embed.add_field(name="Tips", value="\n".join(tips), inline=False)
+            embed.set_footer(text="Auto-sync scheduler is running in background")
+            
+            await ctx.send(embed=embed)
 
     async def _should_respond(self, ctx) -> bool:
         """Check if bot should respond to prevent duplicates"""
@@ -248,16 +427,18 @@ class DiscordBot(commands.Bot):
             logging.warning(f"Failed to load sync cache: {e}")
         return {}
     
-    def _save_sync_cache(self, command_hash: str, sync_time: float, rate_limited: bool = False):
+    def _save_sync_cache(self, command_hash: str, sync_time: float, rate_limited: bool = False, retry_after: int = None):
         """Save the sync cache."""
         try:
             cache_data = {
                 'command_hash': command_hash,
                 'last_sync': sync_time,
-                'rate_limited': rate_limited
+                'rate_limited': rate_limited,
+                'rate_limit_count': self._rate_limit_count,
+                'retry_after': retry_after
             }
             with open(COMMAND_CACHE_FILE, 'w') as f:
-                json.dump(cache_data, f)
+                json.dump(cache_data, f, indent=2)
         except Exception as e:
             logging.warning(f"Failed to save sync cache: {e}")
 
@@ -266,58 +447,177 @@ class DiscordBot(commands.Bot):
         self.session = aiohttp.ClientSession()
         await self.load_cogs()
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        await asyncio.sleep(1)
+        self._auto_sync_task = asyncio.create_task(self._auto_sync_scheduler())
+        
+        # Add startup delay to avoid immediate sync on rapid restarts
+        await asyncio.sleep(5)
 
         # Smart command sync with caching
-        current_hash = self._get_command_hash()
-        cache = self._load_sync_cache()
-        last_hash = cache.get('command_hash')
-        last_sync = cache.get('last_sync', 0)
-        was_rate_limited = cache.get('rate_limited', False)
-        current_time = time.time()
-        
-        # Minimum intervals to avoid rate limits
-        time_since_last_sync = current_time - last_sync
-        min_sync_interval = 300  # 5 minutes
-        rate_limit_backoff = 900  # 15 minutes if previously rate limited
-        
-        # If we were rate limited last time, wait longer
-        if was_rate_limited and time_since_last_sync < rate_limit_backoff:
-            logging.info(f"Skipping sync: Previously rate limited. Wait {int(rate_limit_backoff - time_since_last_sync)}s more")
-            self._synced_commands = self.tree.get_commands()
-            return
-        
-        # Only sync if:
-        # 1. Commands changed AND at least 5 minutes passed
-        # 2. OR it's been more than 1 hour (for periodic refresh)
-        should_sync = (
-            (current_hash != last_hash and time_since_last_sync > min_sync_interval) or 
-            time_since_last_sync > 3600
-        )
-        
-        if should_sync:
-            try:
-                logging.info("Command changes detected, syncing...")
-                self._synced_commands = await self.tree.sync()
-                logging.info(f"Successfully synced {len(self._synced_commands)} slash commands")
-                self._save_sync_cache(current_hash, current_time, rate_limited=False)
-            except HTTPException as e:
-                if e.status == 429:
-                    logging.warning(f"Rate limited! Commands will not sync for 15 minutes.")
-                    # Save that we were rate limited to prevent retries
-                    self._save_sync_cache(current_hash, current_time, rate_limited=True)
-                    self._synced_commands = self.tree.get_commands()
-                else:
-                    logging.error(f"Failed to sync slash commands: {e}")
-            except Exception as e:
-                logging.error(f"Unexpected error during command sync: {e}")
-        else:
-            if time_since_last_sync < min_sync_interval:
-                logging.info(f"Skipping sync: Only {int(time_since_last_sync)}s since last sync (minimum: {min_sync_interval}s)")
+        async with self._sync_lock:
+            # Check if auto-sync is disabled
+            if not AUTO_SYNC_COMMANDS:
+                logging.info("Auto-sync disabled via environment variable. Use .sync command to sync manually.")
+                self._synced_commands = self.tree.get_commands()
+                return
+            
+            current_hash = self._get_command_hash()
+            cache = self._load_sync_cache()
+            last_hash = cache.get('command_hash')
+            last_sync = cache.get('last_sync', 0)
+            was_rate_limited = cache.get('rate_limited', False)
+            self._rate_limit_count = cache.get('rate_limit_count', 0)
+            retry_after = cache.get('retry_after')
+            current_time = time.time()
+            
+            # Minimum intervals to avoid rate limits
+            time_since_last_sync = current_time - last_sync
+            min_sync_interval = 3600  # 1 hour (conservative to avoid rate limits)
+            
+            # Exponential backoff: 1hr, 2hr, 4hr, 8hr, max 24hr
+            rate_limit_backoff = min(3600 * (2 ** self._rate_limit_count), 86400)
+            
+            # If we were rate limited last time, check if backoff period has passed
+            if was_rate_limited and time_since_last_sync < rate_limit_backoff:
+                wait_time = int(rate_limit_backoff - time_since_last_sync)
+                hours = wait_time // 3600
+                minutes = (wait_time % 3600) // 60
+                logging.warning(
+                    f"⚠️ SYNC BLOCKED: Rate limited {self._rate_limit_count} time(s). "
+                    f"Wait {hours}h {minutes}m more. Auto-sync will retry automatically."
+                )
+                self._synced_commands = self.tree.get_commands()
+                return
+            elif was_rate_limited and time_since_last_sync >= rate_limit_backoff:
+                # Backoff period has passed, automatically reset rate limit status
+                logging.info(f"✅ Rate limit backoff period expired. Resetting rate limit status.")
+                self._rate_limit_count = max(0, self._rate_limit_count - 1)  # Gradually reduce count
+                was_rate_limited = False
+            
+            # Only sync if:
+            # 1. Commands changed AND at least 1 hour passed
+            # 2. OR it's been more than 24 hours (for periodic refresh)
+            should_sync = (
+                (current_hash != last_hash and time_since_last_sync > min_sync_interval) or 
+                time_since_last_sync > 86400  # 24 hours
+            )
+            
+            if should_sync:
+                try:
+                    logging.info(f"Command changes detected, syncing... (Last sync: {int(time_since_last_sync/60)}m ago)")
+                    self._synced_commands = await self.tree.sync()
+                    logging.info(f"✅ Successfully synced {len(self._synced_commands)} slash commands")
+                    # Reset rate limit counter on success
+                    self._rate_limit_count = 0
+                    self._last_sync_attempt = current_time
+                    self._save_sync_cache(current_hash, current_time, rate_limited=False, retry_after=None)
+                except HTTPException as e:
+                    if e.status == 429:
+                        # Increment rate limit counter for exponential backoff
+                        self._rate_limit_count += 1
+                        retry_after_seconds = None
+                        try:
+                            retry_after_seconds = int(e.response.headers.get('Retry-After', 0))
+                        except (ValueError, TypeError):
+                            pass
+                        
+                        backoff_time = min(3600 * (2 ** self._rate_limit_count), 86400)
+                        hours = backoff_time // 3600
+                        
+                        logging.error(
+                            f"❌ RATE LIMITED by Discord (attempt #{self._rate_limit_count})! "
+                            f"Discord says retry after: {retry_after_seconds}s. "
+                            f"Bot will automatically retry in {hours}h (exponential backoff)."
+                        )
+                        logging.info(
+                            f"💡 TIP: The bot will handle this automatically. "
+                            f"Use '.reload' for code changes instead of restarting."
+                        )
+                        self._last_sync_attempt = current_time
+                        
+                        # Save that we were rate limited to prevent retries
+                        self._save_sync_cache(current_hash, current_time, rate_limited=True, retry_after=retry_after_seconds)
+                        self._synced_commands = self.tree.get_commands()
+                    else:
+                        logging.error(f"Failed to sync slash commands: {e}")
+                except Exception as e:
+                    logging.error(f"Unexpected error during command sync: {e}")
             else:
-                logging.info("Commands unchanged, skipping sync to avoid rate limits")
-            self._synced_commands = self.tree.get_commands()
+                if time_since_last_sync < min_sync_interval:
+                    minutes = int(time_since_last_sync) // 60
+                    minutes_remaining = int((min_sync_interval - time_since_last_sync) / 60)
+                    logging.info(f"⏭️ Skipping sync: Only {minutes}m since last sync (next allowed in {minutes_remaining}m)")
+                else:
+                    logging.info("⏭️ Commands unchanged, skipping sync to avoid rate limits")
+                self._synced_commands = self.tree.get_commands()
 
+    async def _auto_sync_scheduler(self) -> None:
+        """Automatically retry syncing after rate limit backoff periods"""
+        await asyncio.sleep(60)  # Wait 1 minute after startup
+        
+        while not self.is_closed():
+            try:
+                await asyncio.sleep(300)  # Check every 5 minutes
+                
+                # Load cache to check status
+                cache = self._load_sync_cache()
+                was_rate_limited = cache.get('rate_limited', False)
+                last_sync = cache.get('last_sync', 0)
+                rate_limit_count = cache.get('rate_limit_count', 0)
+                current_time = time.time()
+                time_since_last_sync = current_time - last_sync
+                
+                if not was_rate_limited:
+                    continue  # No action needed
+                
+                # Calculate if backoff period has expired
+                rate_limit_backoff = min(3600 * (2 ** rate_limit_count), 86400)
+                
+                if time_since_last_sync >= rate_limit_backoff:
+                    logging.info("🔄 Auto-sync: Rate limit backoff expired, attempting sync...")
+                    
+                    async with self._sync_lock:
+                        try:
+                            current_hash = self._get_command_hash()
+                            self._synced_commands = await self.tree.sync()
+                            logging.info(f"✅ Auto-sync successful! Synced {len(self._synced_commands)} commands")
+                            
+                            # Reset rate limit on success
+                            self._rate_limit_count = 0
+                            self._save_sync_cache(current_hash, current_time, rate_limited=False, retry_after=None)
+                        except HTTPException as e:
+                            if e.status == 429:
+                                # Still rate limited, increase backoff
+                                self._rate_limit_count = rate_limit_count + 1
+                                retry_after_seconds = None
+                                try:
+                                    retry_after_seconds = int(e.response.headers.get('Retry-After', 0))
+                                except (ValueError, TypeError):
+                                    pass
+                                
+                                new_backoff = min(3600 * (2 ** self._rate_limit_count), 86400)
+                                hours = new_backoff // 3600
+                                logging.warning(
+                                    f"⚠️ Auto-sync still rate limited. "
+                                    f"Will retry in {hours}h (attempt #{self._rate_limit_count})"
+                                )
+                                self._save_sync_cache(current_hash, current_time, rate_limited=True, retry_after=retry_after_seconds)
+                            else:
+                                logging.error(f"Auto-sync failed: {e}")
+                        except Exception as e:
+                            logging.error(f"Auto-sync error: {e}")
+                else:
+                    # Still in backoff period
+                    wait_time = int(rate_limit_backoff - time_since_last_sync)
+                    hours = wait_time // 3600
+                    minutes = (wait_time % 3600) // 60
+                    if minutes > 0 or hours > 0:  # Only log if significant time remaining
+                        logging.debug(f"⏳ Auto-sync waiting: {hours}h {minutes}m until next retry")
+                        
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"Error in auto-sync scheduler: {e}")
+    
     async def _periodic_cleanup(self) -> None:
         """Clean up resources periodically"""
         while not self.is_closed():
@@ -340,6 +640,14 @@ class DiscordBot(commands.Bot):
         print(f"\033[32mLogged in as {self.user.name} ({self.user.id})\033[0m")
         print(f"\033[33mLoaded {len(self._synced_commands)} slash commands\033[0m")
         
+        # Display auto-sync status
+        cache = self._load_sync_cache()
+        if cache.get('rate_limited', False):
+            rate_limit_count = cache.get('rate_limit_count', 0)
+            print(f"\033[33m⚠️  Auto-Sync: Rate limited ({rate_limit_count}x) - Will retry automatically\033[0m")
+        else:
+            print(f"\033[32m✅ Auto-Sync: Active and monitoring\033[0m")
+        
         logging.info(f"Bot ready: {self.user.name} ({self.user.id})")
         logging.info(f"Connected to {len(self.guilds)} guilds")
         logging.info(f"Total commands available: {len(self._synced_commands)}")
@@ -350,7 +658,9 @@ class DiscordBot(commands.Bot):
             print("\033[36mAvailable Slash Commands:\033[0m")
             for cmd in self._synced_commands:
                 print(f"  \033[32m/{cmd.name}\033[0m - {cmd.description}")
-            print("\033[36m" + "=" * 50 + "\033[0m\n")
+            print("\033[36m" + "=" * 50 + "\033[0m")
+            print(f"\033[35m💡 TIP: Use .reload to reload cogs without restarting!\033[0m")
+            print(f"\033[35m📊 TIP: Use .syncstatus to check sync status anytime!\033[0m\n")
         else:
             print()
 
@@ -362,15 +672,25 @@ class DiscordBot(commands.Bot):
         print("\033[31mBot is shutting down...\033[0m")
         print("\033[33m" + "=" * 50 + "\033[0m\n")
 
-        if self._cleanup_task and not self._cleanup_task.done():
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+        # Cancel background tasks
+        for task in [self._cleanup_task, self._auto_sync_task]:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         if self.session and not self.session.closed:
             await self.session.close()
+        
+        # Close shared MongoDB connection
+        if self.mongo_client:
+            try:
+                self.mongo_client.close()
+                logging.info("Shared MongoDB connection closed")
+            except Exception as e:
+                logging.error(f"Error closing MongoDB connection: {e}")
 
         await super().close()
 
