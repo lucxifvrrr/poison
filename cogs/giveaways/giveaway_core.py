@@ -993,7 +993,7 @@ class GiveawayCog(commands.Cog):
             if thumbnail_url:
                 embed.set_thumbnail(url=thumbnail_url)
             if icon:
-                embed.set_footer(text=interaction.guild.name, icon_url=icon)
+                embed.set_footer(icon_url=icon)
 
             view = GiveawayJoinView(str(0), self.db, self)  # Temporary message_id
             msg = await interaction.channel.send(embed=embed, view=view)
@@ -1135,7 +1135,7 @@ class GiveawayCog(commands.Cog):
             if thumbnail_url:
                 embed.set_thumbnail(url=thumbnail_url)
             if icon:
-                embed.set_footer(text=chan.guild.name, icon_url=icon)
+                embed.set_footer(icon_url=icon)
 
             view = GiveawayEndedView(total_participants, message_id, self.db, self.bot)
             
@@ -1395,7 +1395,7 @@ class GiveawayCog(commands.Cog):
             if thumbnail_url:
                 embed.set_thumbnail(url=thumbnail_url)
             if icon:
-                embed.set_footer(text=ctx.guild.name, icon_url=icon)
+                embed.set_footer(icon_url=icon)
             
             view = GiveawayJoinView(str(0), self.db, self)
             msg = await ctx.send(embed=embed, view=view)
