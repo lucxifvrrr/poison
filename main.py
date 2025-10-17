@@ -702,14 +702,26 @@ class DiscordBot(commands.Bot):
         # Files to skip (not cogs)
         skip_files = {'config.py', '__init__.py'}
         
+        # Collect all modules first
+        modules_to_load = []
+        priority_modules = []  # Modules that should load first
+        
         # Walk through cogs directory and subdirectories
         for root, dirs, files in os.walk(COGS_DIR):
             # Get relative path from cogs directory
             rel_path = os.path.relpath(root, COGS_DIR)
             
             for filename in files:
-                # Skip non-Python files and special files
+                # Skip non-Python files, special files, and documentation files
                 if not filename.endswith('.py') or filename in skip_files:
+                    continue
+                
+                # Skip files that are all uppercase (likely documentation/config)
+                if filename.replace('.py', '').replace('_', '').isupper():
+                    continue
+                
+                # Skip markdown-like files
+                if filename.endswith('.md.py') or 'SYNC' in filename.upper() or 'README' in filename.upper():
                     continue
                 
                 # Build module path
@@ -721,11 +733,21 @@ class DiscordBot(commands.Bot):
                     rel_module = rel_path.replace(os.sep, '.')
                     module = f"{COGS_DIR}.{rel_module}.{filename[:-3]}"
                 
-                try:
-                    await self.load_extension(module)
-                    logging.info(f"Loaded cog: {module}")
-                except Exception as e:
-                    logging.error(f"Failed to load cog {module}: {e}")
+                # Prioritize core modules that other cogs depend on
+                if 'core' in filename.lower() or filename in ['giveaway_core.py']:
+                    priority_modules.append(module)
+                else:
+                    modules_to_load.append(module)
+        
+        # Load priority modules first, then the rest
+        all_modules = priority_modules + modules_to_load
+        
+        for module in all_modules:
+            try:
+                await self.load_extension(module)
+                logging.info(f"Loaded cog: {module}")
+            except Exception as e:
+                logging.error(f"Failed to load cog {module}: {e}")
 
     async def send_error_report(self, error_message: str) -> None:
         if not self.session or self.session.closed or self.is_closed():

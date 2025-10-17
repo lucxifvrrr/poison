@@ -8,10 +8,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+__all__ = [
+    'REACTION_EMOJI', 'DOT_EMOJI', 'RED_DOT_EMOJI', 'EMBED_COLOR',
+    'CLEANUP_INTERVAL', 'ENTRIES_PER_PAGE', 'GiveawayConfig',
+    'MIN_GIVEAWAY_DURATION', 'MAX_GIVEAWAY_DURATION', 'MIN_WINNERS', 'MAX_WINNERS',
+    'DURATION_UNITS', 'PRIZE_EMOJI', 'WINNER_EMOJI', 'TIME_EMOJI', 'GIVEAWAY_THUMBNAIL_URL',
+    'MIN_FAKE_REACTIONS', 'MAX_FAKE_REACTIONS', 'MIN_FAKE_DURATION', 'MAX_FAKE_DURATION',
+    'FOOTER_ICON_URL', 'GIFT_EMOJI'
+]
+
 # Emoji constants
 REACTION_EMOJI = "<:sukoon_taaada:1324071825910792223>"
 DOT_EMOJI = "<:sukoon_blackdot:1322894649488314378>"
 RED_DOT_EMOJI = "<:sukoon_redpoint:1322894737736339459>"
+
+# Custom emojis for giveaway embed (configurable)
+PRIZE_EMOJI = "<:ogs_gif:1428639542100885585>"  # Change this to your custom emoji
+WINNER_EMOJI = "<:ogs_crow:1428639113317453825>"  # Change this to your custom emoji
+TIME_EMOJI = "<:ogs_time:1428638675608141906>"  # Change this to your custom emoji
+GIFT_EMOJI = "<a:ogs_gift:1428659726790426686>"  # Gift emoji for giveaway titles
+
+# Thumbnail URL for giveaway embeds (set your custom thumbnail URL here)
+GIVEAWAY_THUMBNAIL_URL = "https://images-ext-1.discordapp.net/external/7RBwotHDp9qC1T5jYqRrwYTE_QQk7jAsJTiYkJ5DAyo/https/i.postimg.cc/j5x98YMw/1f381.gif?width=640&height=640"
+
+# Footer icon URL for giveaway embeds
+FOOTER_ICON_URL = "https://media.discordapp.net/attachments/1428636041538965607/1428647953496539227/b8b7454ac714509f8c173209f79496a9-removebg-preview.png?ex=68f34397&is=68f1f217&hm=1bf6af4e38895881c2f8cda30ed0a973c8a8abcf68be53bcd1a9baed38974f92&=&format=webp&quality=lossless&width=625&height=625"
 
 # Color constants
 EMBED_COLOR = 0x2f3136
@@ -31,6 +52,15 @@ MIN_FAKE_REACTIONS = 1
 MAX_FAKE_REACTIONS = 1000
 MIN_FAKE_DURATION = 1  # minutes
 MAX_FAKE_DURATION = 10080  # 7 days in minutes
+
+# Duration parsing units
+DURATION_UNITS = {
+    's': 1,
+    'm': 60,
+    'h': 3600,
+    'd': 86400,
+    'w': 604800  # week support
+}
 
 @dataclass
 class GiveawayConfig:
@@ -75,12 +105,3 @@ class GiveawayConfig:
             enable_statistics=os.getenv('ENABLE_STATISTICS', 'true').lower() == 'true',
             db_path=os.getenv('GIVEAWAY_DB_PATH')
         )
-
-# Duration parsing units
-DURATION_UNITS = {
-    's': 1,
-    'm': 60,
-    'h': 3600,
-    'd': 86400,
-    'w': 604800  # week support
-}

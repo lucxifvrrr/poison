@@ -353,193 +353,172 @@ class CountingCog(commands.Cog):
     # ---------- Counting command group ----------
     count_group = app_commands.Group(name="count", description="Counting game commands")
     
-    @count_group.command(name="info", description="Show counting info")
-    async def info(self, interaction: discord.Interaction):
-        """View counting status"""
+    @count_group.command(name="view", description="View counting info and leaderboard")
+    @app_commands.describe(show_leaderboard="Show full leaderboard (default: show status)")
+    async def view(self, interaction: discord.Interaction, show_leaderboard: bool = False):
+        """View counting status or leaderboard"""
         if not interaction.guild:
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
         
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not show_leaderboard)
         doc = await self._get_or_create(interaction.guild.id)
-        ch = interaction.guild.get_channel(doc.get("channel_id")) if doc.get("channel_id") else None
-        last_user = interaction.guild.get_member(doc["last_user"]) if doc.get("last_user") else None
-        top = sorted(doc.get("counts", {}).items(), key=lambda x: x[1], reverse=True)[:10]
-        lb = "\n".join([f"<@{uid}> — {cnt}" for uid, cnt in top]) or "No counts yet."
         
-        embed = discord.Embed(title="Counting Status", color=EMBED_COLOR)
-        embed.add_field(name="Channel", value=(ch.mention if ch else "Not set"), inline=True)
-        embed.add_field(name="Last Count", value=str(doc.get("current", 0)), inline=True)
-        embed.add_field(name="Next Number", value=str(doc.get("current", 0) + 1), inline=True)
-        embed.add_field(name="Record", value=str(doc.get("record", 0)), inline=True)
-        embed.add_field(name="Last user", value=(last_user.mention if last_user else "None"), inline=True)
-        embed.add_field(name="Top Contributors (Top 10)", value=lb, inline=False)
-        embed.set_footer(text=f"Deletion queue: {len(self.deletion_queue)} messages")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    
-    @count_group.command(name="top", description="Show top counters")
-    async def top(self, interaction: discord.Interaction):
-        """View counting leaderboard"""
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-            return
-        
-        await interaction.response.defer()
-        doc = await self._get_or_create(interaction.guild.id)
-        top = sorted(doc.get("counts", {}).items(), key=lambda x: x[1], reverse=True)[:10]
-        embed = discord.Embed(title="🏆 Counting Leaderboard", color=EMBED_COLOR)
-        if not top:
-            embed.description = "No counts recorded yet."
+        if show_leaderboard:
+            # Show leaderboard
+            top = sorted(doc.get("counts", {}).items(), key=lambda x: x[1], reverse=True)[:10]
+            embed = discord.Embed(title="🏆 Counting Leaderboard", color=EMBED_COLOR)
+            if not top:
+                embed.description = "No counts recorded yet."
+            else:
+                for i, (uid, cnt) in enumerate(top, start=1):
+                    medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
+                    embed.add_field(name=f"{medal} <@{uid}>", value=f"{cnt} counts", inline=False)
+            await interaction.followup.send(embed=embed)
         else:
-            for i, (uid, cnt) in enumerate(top, start=1):
-                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
-                embed.add_field(name=f"{medal} <@{uid}>", value=f"{cnt} counts", inline=False)
-        await interaction.followup.send(embed=embed)
+            # Show status info
+            ch = interaction.guild.get_channel(doc.get("channel_id")) if doc.get("channel_id") else None
+            last_user = interaction.guild.get_member(doc["last_user"]) if doc.get("last_user") else None
+            top = sorted(doc.get("counts", {}).items(), key=lambda x: x[1], reverse=True)[:10]
+            lb = "\n".join([f"<@{uid}> — {cnt}" for uid, cnt in top]) or "No counts yet."
+            
+            embed = discord.Embed(title="📊 Counting Status", color=EMBED_COLOR)
+            embed.add_field(name="Channel", value=(ch.mention if ch else "Not set"), inline=True)
+            embed.add_field(name="Last Count", value=str(doc.get("current", 0)), inline=True)
+            embed.add_field(name="Next Number", value=str(doc.get("current", 0) + 1), inline=True)
+            embed.add_field(name="Record", value=str(doc.get("record", 0)), inline=True)
+            embed.add_field(name="Last user", value=(last_user.mention if last_user else "None"), inline=True)
+            embed.add_field(name="Banned Users", value=str(len(doc.get("banned", []))), inline=True)
+            embed.add_field(name="Top Contributors (Top 10)", value=lb, inline=False)
+            embed.set_footer(text=f"Deletion queue: {len(self.deletion_queue)} messages")
+            await interaction.followup.send(embed=embed, ephemeral=True)
     
-    @count_group.command(name="setup", description="Set counting channel")
-    @app_commands.describe(channel="Pick a channel for counting")
+    @count_group.command(name="settings", description="Configure all counting settings")
+    @app_commands.describe(
+        counting_channel="Set the channel for counting",
+        log_channel="Set the channel for logs",
+        emoji="Set custom reaction emoji",
+        reset_count="Reset count to 0 (True/False)",
+        set_number="Jump to a specific number",
+        ban_user="Ban or unban a user from counting"
+    )
     @app_commands.checks.has_permissions(administrator=True)
-    async def setup(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        """Set counting channel"""
+    async def settings(
+        self, 
+        interaction: discord.Interaction, 
+        counting_channel: discord.TextChannel = None,
+        log_channel: discord.TextChannel = None,
+        emoji: str = None,
+        reset_count: bool = None,
+        set_number: int = None,
+        ban_user: discord.Member = None
+    ):
+        """Unified settings command for all counting configuration"""
         if not interaction.guild:
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
         
-        # Validate bot has permissions in channel
-        perms = channel.permissions_for(interaction.guild.me)
-        if not (perms.read_messages and perms.send_messages and perms.manage_messages):
+        # Check if at least one parameter is provided
+        if all(param is None for param in [counting_channel, log_channel, emoji, reset_count, set_number, ban_user]):
             await interaction.response.send_message(
-                f"⚠ Missing permissions in {channel.mention}. I need: Read Messages, Send Messages, Manage Messages.",
+                "⚠️ Please provide at least one setting to configure.\n"
+                "**Available options:**\n"
+                "• `counting_channel` - Set counting channel\n"
+                "• `log_channel` - Set log channel\n"
+                "• `emoji` - Set reaction emoji\n"
+                "• `reset_count` - Reset to 0 (True)\n"
+                "• `set_number` - Jump to specific number\n"
+                "• `ban_user` - Ban/unban a user",
                 ephemeral=True
             )
-            return
-        
-        await self._get_or_create(interaction.guild.id)
-        await self.upsert_fields(interaction.guild.id, {"channel_id": channel.id})
-        await interaction.response.send_message(embed=discord.Embed(
-            title="✓ Counting channel set",
-            description=f"{channel.mention} is now the counting channel.",
-            color=EMBED_COLOR
-        ), ephemeral=True)
-        await self._log(interaction.guild.id, f"Counting channel set to {channel.mention} by {interaction.user}.")
-    
-    @count_group.command(name="logs", description="Set log channel")
-    @app_commands.describe(channel="Where to send logs")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def logs(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        """Set log channel"""
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-            return
-        
-        perms = channel.permissions_for(interaction.guild.me)
-        if not (perms.read_messages and perms.send_messages):
-            await interaction.response.send_message(
-                f"⚠ Missing permissions in {channel.mention}. I need: Read Messages, Send Messages.",
-                ephemeral=True
-            )
-            return
-        
-        await self._get_or_create(interaction.guild.id)
-        await self.upsert_fields(interaction.guild.id, {"log_channel_id": channel.id})
-        await interaction.response.send_message(embed=discord.Embed(
-            title="✓ Log channel set",
-            description=f"{channel.mention} will receive counting logs.",
-            color=EMBED_COLOR
-        ), ephemeral=True)
-        await self._log(interaction.guild.id, f"Log channel set to {channel.mention} by {interaction.user}.")
-    
-    @count_group.command(name="reset", description="Start over from 1")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def reset(self, interaction: discord.Interaction):
-        """Reset count"""
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-            return
-        
-        await self._get_or_create(interaction.guild.id)
-        await self.upsert_fields(interaction.guild.id, {"current": 0, "last_user": None})
-        await interaction.response.send_message(
-            "✓ Count reset! Next number is 1.", 
-            ephemeral=True
-        )
-        await self._log(interaction.guild.id, f"Count reset by {interaction.user} ({interaction.user.id}).")
-    
-    @count_group.command(name="set", description="Jump to a number")
-    @app_commands.describe(number="What number to continue from")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def set(self, interaction: discord.Interaction, number: int):
-        """Set count number"""
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-            return
-        
-        if number <= 0:
-            await interaction.response.send_message("Number must be positive (1 or greater).", ephemeral=True)
-            return
-        
-        await self._get_or_create(interaction.guild.id)
-        await self.upsert_fields(interaction.guild.id, {"current": number - 1, "last_user": None})
-        await interaction.response.send_message(
-            f"✓ Count set! Next number should be **{number}**.", 
-            ephemeral=True
-        )
-        await self._log(interaction.guild.id, f"Count set to {number} by {interaction.user}.")
-    
-    @count_group.command(name="ban", description="Ban/unban someone")
-    @app_commands.describe(user="User to ban or unban")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def ban(self, interaction: discord.Interaction, user: discord.Member):
-        """Ban/unban user from counting"""
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
         
         doc = await self._get_or_create(interaction.guild.id)
-        banned = set(doc.get("banned", []))
-        uid = user.id
+        updates = {}
+        messages = []
         
-        if uid in banned:
-            banned.remove(uid)
-            await self.upsert_fields(interaction.guild.id, {"banned": list(banned)})
-            await interaction.response.send_message(
-                f"✓ Unbanned {user.mention} from counting.", 
-                ephemeral=True
-            )
-            await self._log(interaction.guild.id, f"{user} ({uid}) unbanned by {interaction.user}.")
-        else:
-            banned.add(uid)
-            await self.upsert_fields(interaction.guild.id, {"banned": list(banned)})
-            await interaction.response.send_message(
-                f"✓ Banned {user.mention} from counting. Their messages will be deleted.", 
-                ephemeral=True
-            )
-            await self._log(interaction.guild.id, f"{user} ({uid}) banned from counting by {interaction.user}.")
-    
-    @count_group.command(name="emoji", description="Change reaction emoji")
-    @app_commands.describe(emoji="Emoji to use (e.g., ✅ or custom emoji)")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def emoji(self, interaction: discord.Interaction, emoji: str):
-        """Set custom emoji for counting"""
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-            return
+        # Handle counting channel
+        if counting_channel:
+            perms = counting_channel.permissions_for(interaction.guild.me)
+            if not (perms.read_messages and perms.send_messages and perms.manage_messages):
+                await interaction.response.send_message(
+                    f"⚠ Missing permissions in {counting_channel.mention}. I need: Read Messages, Send Messages, Manage Messages.",
+                    ephemeral=True
+                )
+                return
+            updates["channel_id"] = counting_channel.id
+            messages.append(f"✓ Counting channel set to {counting_channel.mention}")
+            await self._log(interaction.guild.id, f"Counting channel set to {counting_channel.mention} by {interaction.user}.")
         
-        # Validate emoji
-        if not await self.validate_emoji(emoji.strip(), interaction.guild):
-            await interaction.response.send_message(
-                "⚠️ Invalid emoji or I don't have access to it. Use a standard emoji or a custom emoji from this server.",
-                ephemeral=True
-            )
-            return
+        # Handle log channel
+        if log_channel:
+            perms = log_channel.permissions_for(interaction.guild.me)
+            if not (perms.read_messages and perms.send_messages):
+                await interaction.response.send_message(
+                    f"⚠ Missing permissions in {log_channel.mention}. I need: Read Messages, Send Messages.",
+                    ephemeral=True
+                )
+                return
+            updates["log_channel_id"] = log_channel.id
+            messages.append(f"✓ Log channel set to {log_channel.mention}")
+            await self._log(interaction.guild.id, f"Log channel set to {log_channel.mention} by {interaction.user}.")
         
-        await self._get_or_create(interaction.guild.id)
-        await self.upsert_fields(interaction.guild.id, {"emoji": emoji.strip()})
-        await interaction.response.send_message(
-            f"✓ Reaction emoji set to {emoji.strip()}", 
-            ephemeral=True
+        # Handle emoji
+        if emoji:
+            if not await self.validate_emoji(emoji.strip(), interaction.guild):
+                await interaction.response.send_message(
+                    "⚠️ Invalid emoji or I don't have access to it. Use a standard emoji or a custom emoji from this server.",
+                    ephemeral=True
+                )
+                return
+            updates["emoji"] = emoji.strip()
+            messages.append(f"✓ Reaction emoji set to {emoji.strip()}")
+            await self._log(interaction.guild.id, f"Count emoji changed to {emoji.strip()} by {interaction.user}.")
+        
+        # Handle reset
+        if reset_count is True:
+            updates["current"] = 0
+            updates["last_user"] = None
+            messages.append("✓ Count reset! Next number is 1")
+            await self._log(interaction.guild.id, f"Count reset by {interaction.user} ({interaction.user.id}).")
+        
+        # Handle set number
+        if set_number is not None:
+            if set_number <= 0:
+                await interaction.response.send_message("Number must be positive (1 or greater).", ephemeral=True)
+                return
+            updates["current"] = set_number - 1
+            updates["last_user"] = None
+            messages.append(f"✓ Count set! Next number should be **{set_number}**")
+            await self._log(interaction.guild.id, f"Count set to {set_number} by {interaction.user}.")
+        
+        # Handle ban/unban user
+        if ban_user:
+            banned = set(doc.get("banned", []))
+            uid = ban_user.id
+            
+            if uid in banned:
+                banned.remove(uid)
+                updates["banned"] = list(banned)
+                messages.append(f"✓ Unbanned {ban_user.mention} from counting")
+                await self._log(interaction.guild.id, f"{ban_user} ({uid}) unbanned by {interaction.user}.")
+            else:
+                banned.add(uid)
+                updates["banned"] = list(banned)
+                messages.append(f"✓ Banned {ban_user.mention} from counting")
+                await self._log(interaction.guild.id, f"{ban_user} ({uid}) banned from counting by {interaction.user}.")
+        
+        # Apply all updates
+        if updates:
+            await self.upsert_fields(interaction.guild.id, updates)
+        
+        # Send response
+        embed = discord.Embed(
+            title="⚙️ Settings Updated",
+            description="\n".join(messages),
+            color=EMBED_COLOR
         )
-        await self._log(interaction.guild.id, f"Count emoji changed to {emoji.strip()} by {interaction.user}.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
     # ---------- Logging helper ----------

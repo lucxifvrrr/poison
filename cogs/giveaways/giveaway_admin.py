@@ -9,7 +9,10 @@ from discord.ext import commands, tasks
 
 # Import from core and config
 from cogs.giveaways.giveaway_core import get_current_utc_timestamp
-from cogs.giveaways.config import DOT_EMOJI, RED_DOT_EMOJI, EMBED_COLOR, MIN_FAKE_REACTIONS, MAX_FAKE_REACTIONS, MIN_FAKE_DURATION, MAX_FAKE_DURATION
+from cogs.giveaways.config import (
+    DOT_EMOJI, RED_DOT_EMOJI, EMBED_COLOR, MIN_FAKE_REACTIONS, MAX_FAKE_REACTIONS, 
+    MIN_FAKE_DURATION, MAX_FAKE_DURATION, PRIZE_EMOJI, WINNER_EMOJI, TIME_EMOJI, GIFT_EMOJI
+)
 
 class GiveawayAdminCog(commands.Cog):
     """Admin commands for managing giveaways."""
@@ -24,6 +27,7 @@ class GiveawayAdminCog(commands.Cog):
         """Called when cog is loaded."""
         self.process_fake_reactions.start()
         self._ready.set()
+        self.logger.info("[OK] GiveawayAdminCog loaded (commands registered in GiveawayCog)")
 
     def cog_unload(self) -> None:
         """Called when cog is unloaded."""
@@ -44,29 +48,42 @@ class GiveawayAdminCog(commands.Cog):
             return
 
         try:
-            plans = await giveaway_cog.db.fetchall(
-                "SELECT * FROM fake_reactions WHERE status = ?", ("active",)
-            )
+            plans = await giveaway_cog.db.fake_reactions.find({"status": "active"}).to_list(length=None)
             for plan in plans:
                 mid = plan["message_id"]
                 if mid in self.active_fake_reaction_tasks:
                     continue
 
                 # Ensure giveaway still active
-                gw = await giveaway_cog.db.fetchone(
-                    "SELECT * FROM giveaways WHERE message_id = ? AND status = ?",
-                    (mid, "active"),
-                )
+                gw = await giveaway_cog.db.giveaways.find_one({
+                    "message_id": mid,
+                    "status": "active"
+                })
                 if not gw:
                     # Cancel stale plan
-                    await giveaway_cog.db.execute(
-                        "UPDATE fake_reactions SET status = ?, cancelled_at = ? WHERE message_id = ?",
-                        ("cancelled", get_current_utc_timestamp(), mid),
+                    await giveaway_cog.db.fake_reactions.update_one(
+                        {"message_id": mid},
+                        {"$set": {
+                            "status": "cancelled",
+                            "cancelled_at": get_current_utc_timestamp()
+                        }}
                     )
                     continue
 
                 channel = self.bot.get_channel(plan["channel_id"])
                 if not channel or not isinstance(channel, discord.TextChannel):
+                    # Cancel plan if channel not found
+                    await giveaway_cog.db.fake_reactions.update_one(
+                        {"message_id": mid},
+                        {"$set": {
+                            "status": "cancelled",
+                            "cancelled_at": get_current_utc_timestamp(),
+                            "error": "Channel not found"
+                        }}
+                    )
+                    continue
+
+                if not hasattr(channel, 'guild') or not channel.guild:
                     continue
 
                 members = [str(m.id) for m in channel.guild.members if not m.bot]
@@ -84,13 +101,7 @@ class GiveawayAdminCog(commands.Cog):
         except Exception as e:
             self.logger.error(f"process_fake_reactions error: {e}")
 
-    @discord.app_commands.command(
-        name="fill_giveaway",
-        description="Gradually fill a giveaway with fake reactions",
-    )
-    @discord.app_commands.guild_only()
-    @discord.app_commands.default_permissions(administrator=True)
-    async def fill_giveaway(
+    async def fill(
         self,
         interaction: discord.Interaction,
         message_id: str,
@@ -114,10 +125,10 @@ class GiveawayAdminCog(commands.Cog):
                     "Giveaway system not available.", ephemeral=True
                 )
 
-            gw = await giveaway_cog.db.fetchone(
-                "SELECT * FROM giveaways WHERE message_id = ? AND status = ?",
-                (message_id, "active"),
-            )
+            gw = await giveaway_cog.db.giveaways.find_one({
+                "message_id": message_id,
+                "status": "active"
+            })
             if not gw:
                 return await interaction.followup.send(
                     "Not an active giveaway.", ephemeral=True
@@ -128,6 +139,11 @@ class GiveawayAdminCog(commands.Cog):
                 self.active_fake_reaction_tasks[message_id].cancel()
 
             channel = self.bot.get_channel(gw["channel_id"])
+            if not channel:
+                return await interaction.followup.send(
+                    "Could not find giveaway channel.", ephemeral=True
+                )
+            
             try:
                 await channel.fetch_message(int(message_id))
             except:
@@ -142,22 +158,18 @@ class GiveawayAdminCog(commands.Cog):
                 )
 
             end_time = get_current_utc_timestamp() + duration_in_minutes * 60
-            await giveaway_cog.db.execute(
-                """
-                INSERT OR REPLACE INTO fake_reactions
-                (message_id, channel_id, total_reactions, remaining_reactions, end_time, created_by, created_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    message_id,
-                    gw["channel_id"],
-                    total_fake_reactions,
-                    total_fake_reactions,
-                    end_time,
-                    interaction.user.id,
-                    get_current_utc_timestamp(),
-                    "active",
-                ),
+            await giveaway_cog.db.fake_reactions.update_one(
+                {"message_id": message_id},
+                {"$set": {
+                    "channel_id": gw["channel_id"],
+                    "total_reactions": total_fake_reactions,
+                    "remaining_reactions": total_fake_reactions,
+                    "end_time": end_time,
+                    "created_by": interaction.user.id,
+                    "created_at": get_current_utc_timestamp(),
+                    "status": "active"
+                }},
+                upsert=True
             )
 
             task = asyncio.create_task(
@@ -195,13 +207,15 @@ class GiveawayAdminCog(commands.Cog):
             return
 
         try:
-            gw = await giveaway_cog.db.fetchone(
-                "SELECT * FROM giveaways WHERE message_id = ?", (message_id,)
-            )
+            gw = await giveaway_cog.db.giveaways.find_one({"message_id": message_id})
             if not gw:
                 return
 
             channel = self.bot.get_channel(gw["channel_id"])
+            if not channel:
+                self.logger.error(f"Channel not found for giveaway {message_id}")
+                return
+            
             message = await channel.fetch_message(int(message_id))
 
             remaining = total_reactions
@@ -214,21 +228,18 @@ class GiveawayAdminCog(commands.Cog):
                 if now >= end_time:
                     break
 
-                active = await giveaway_cog.db.fetchone(
-                    "SELECT * FROM giveaways WHERE message_id = ? AND status = ?",
-                    (message_id, "active"),
-                )
+                active = await giveaway_cog.db.giveaways.find_one({
+                    "message_id": message_id,
+                    "status": "active"
+                })
                 if not active:
                     break
 
-                used = await giveaway_cog.db.fetchall(
-                    """
-                    SELECT original_user_id FROM participants
-                    WHERE message_id = ? AND is_fake = 1
-                    """,
-                    (message_id,),
-                )
-                used_ids = {row["original_user_id"] for row in used if row["original_user_id"]}
+                used = await giveaway_cog.db.participants.find({
+                    "message_id": message_id,
+                    "is_fake": 1
+                }).to_list(length=None)
+                used_ids = {row["original_user_id"] for row in used if row.get("original_user_id")}
 
                 available = [uid for uid in member_ids if uid not in used_ids]
                 if not available:
@@ -238,88 +249,96 @@ class GiveawayAdminCog(commands.Cog):
                 fake_id = f"{user_id}_fake_{total_reactions - remaining}"
 
                 # Check if this fake user already exists in the participants table
-                existing = await giveaway_cog.db.fetchone(
-                    "SELECT * FROM participants WHERE message_id = ? AND user_id = ?",
-                    (message_id, fake_id)
-                )
+                existing = await giveaway_cog.db.participants.find_one({
+                    "message_id": message_id,
+                    "user_id": fake_id
+                })
                 
                 # Only insert if they don't already exist
                 if not existing:
-                    await giveaway_cog.db.execute(
-                        """
-                        INSERT INTO participants
-                        (message_id, user_id, original_user_id, joined_at, is_fake, is_forced)
-                        VALUES (?, ?, ?, ?, ?, 0)
-                        """,
-                        (message_id, fake_id, user_id, now, 1),
-                    )
+                    try:
+                        await giveaway_cog.db.participants.insert_one({
+                            "message_id": message_id,
+                            "user_id": fake_id,
+                            "original_user_id": user_id,
+                            "joined_at": now,
+                            "is_fake": 1,
+                            "is_forced": 0
+                        })
+                    except Exception as e:
+                        # Handle duplicate key error (race condition)
+                        if "duplicate key" not in str(e).lower():
+                            self.logger.error(f"Error inserting fake participant: {e}")
 
                 remaining -= 1
-                await giveaway_cog.db.execute(
-                    "UPDATE fake_reactions SET remaining_reactions = ? WHERE message_id = ?",
-                    (remaining, message_id),
+                await giveaway_cog.db.fake_reactions.update_one(
+                    {"message_id": message_id},
+                    {"$set": {"remaining_reactions": remaining}}
                 )
 
                 # Update embed with native timestamps & timestamp field
-                embed = message.embeds[0]
-                embed.description = (
-                    f"{DOT_EMOJI} Ends: <t:{gw['end_time']}:R>\n"
-                    f"{DOT_EMOJI} Hosted by: <@{gw['host_id']}>"
-                )
-                embed.timestamp = datetime.fromtimestamp(gw["end_time"], timezone.utc)
-                await message.edit(embed=embed)
+                if message.embeds:
+                    embed = message.embeds[0]
+                    prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
+                    embed.description = (
+                        f"{WINNER_EMOJI} **Winner:** {gw['winners_count']}\n"
+                        f"{TIME_EMOJI} **Ends:** <t:{gw['end_time']}:R>\n"
+                        f"{PRIZE_EMOJI} **Hosted by:** <@{gw['host_id']}>"
+                    )
+                    embed.timestamp = datetime.fromtimestamp(gw["end_time"], timezone.utc)
+                    await message.edit(embed=embed)
 
                 # Spread reactions evenly/randomly
-                avg = max((end_time - now) / max(1, remaining), 1)
+                time_left = max(end_time - now, 1)
+                avg = max(time_left / max(1, remaining), 1)
                 delay = random.uniform(avg * 0.5, avg * 1.5)
                 if now + delay > end_time:
                     break
-                await asyncio.sleep(delay)
+                await asyncio.sleep(min(delay, time_left))
 
             # On finish, record fake participants
-            rows = await giveaway_cog.db.fetchall(
-                "SELECT user_id FROM participants WHERE message_id = ? AND is_fake = 1",
-                (message_id,),
-            )
+            rows = await giveaway_cog.db.participants.find({
+                "message_id": message_id,
+                "is_fake": 1
+            }).to_list(length=None)
             fake_list = [r["user_id"] for r in rows]
-            await giveaway_cog.db.execute(
-                """
-                UPDATE fake_reactions SET
-                  status = ?, completed_at = ?, remaining_reactions = 0, fake_participants = ?
-                WHERE message_id = ?
-                """,
-                ("completed", get_current_utc_timestamp(), json.dumps(fake_list), message_id),
+            await giveaway_cog.db.fake_reactions.update_one(
+                {"message_id": message_id},
+                {"$set": {
+                    "status": "completed",
+                    "completed_at": get_current_utc_timestamp(),
+                    "remaining_reactions": 0,
+                    "fake_participants": json.dumps(fake_list)
+                }}
             )
 
         except asyncio.CancelledError:
-            await giveaway_cog.db.execute(
-                """
-                UPDATE fake_reactions
-                SET status = ?, cancelled_at = ?
-                WHERE message_id = ?
-                """,
-                ("cancelled", get_current_utc_timestamp(), message_id),
-            )
+            try:
+                await giveaway_cog.db.fake_reactions.update_one(
+                    {"message_id": message_id},
+                    {"$set": {
+                        "status": "cancelled",
+                        "cancelled_at": get_current_utc_timestamp()
+                    }}
+                )
+            except Exception as e:
+                self.logger.error(f"Error updating cancelled status: {e}")
         except Exception as e:
             self.logger.error(f"add_fake_reactions error for {message_id}: {e}")
-            await giveaway_cog.db.execute(
-                """
-                UPDATE fake_reactions
-                SET status = ?, error = ?
-                WHERE message_id = ?
-                """,
-                ("error", str(e), message_id),
-            )
+            try:
+                await giveaway_cog.db.fake_reactions.update_one(
+                    {"message_id": message_id},
+                    {"$set": {
+                        "status": "error",
+                        "error": str(e)
+                    }}
+                )
+            except Exception as db_error:
+                self.logger.error(f"Error updating error status: {db_error}")
         finally:
             self.active_fake_reaction_tasks.pop(message_id, None)
 
-    @discord.app_commands.command(
-        name="force_winner",
-        description="Force specific users to win a giveaway"
-    )
-    @discord.app_commands.guild_only()
-    @discord.app_commands.default_permissions(administrator=True)
-    async def force_winner(
+    async def force_winner_cmd(
         self,
         interaction: discord.Interaction,
         message_id: str,
@@ -351,16 +370,21 @@ class GiveawayAdminCog(commands.Cog):
                     "Please mention users or provide valid IDs.", ephemeral=True
                 )
 
-            gw = await giveaway_cog.db.fetchone(
-                "SELECT * FROM giveaways WHERE message_id = ? AND status = ?",
-                (message_id, "active"),
-            )
+            gw = await giveaway_cog.db.giveaways.find_one({
+                "message_id": message_id,
+                "status": "active"
+            })
             if not gw:
                 return await interaction.followup.send(
                     "Not an active giveaway.", ephemeral=True
                 )
 
             channel = self.bot.get_channel(gw["channel_id"])
+            if not channel:
+                return await interaction.followup.send(
+                    "Could not find giveaway channel.", ephemeral=True
+                )
+            
             try:
                 message = await channel.fetch_message(int(message_id))
             except:
@@ -378,38 +402,39 @@ class GiveawayAdminCog(commands.Cog):
                     )
 
             # Persist forced winners
-            await giveaway_cog.db.execute(
-                "UPDATE giveaways SET forced_winner_ids = ? WHERE message_id = ?",
-                (json.dumps(user_id_list), message_id),
+            await giveaway_cog.db.giveaways.update_one(
+                {"message_id": message_id},
+                {"$set": {"forced_winner_ids": user_id_list}}
             )
 
             # Add each forced winner as a participant if they don't already exist
             for uid in user_id_list:
                 # Check if this user already exists in the participants table
-                existing = await giveaway_cog.db.fetchone(
-                    "SELECT * FROM participants WHERE message_id = ? AND user_id = ?",
-                    (message_id, uid)
-                )
+                existing = await giveaway_cog.db.participants.find_one({
+                    "message_id": message_id,
+                    "user_id": uid
+                })
                 
                 # Only insert if they don't already exist
                 if not existing:
-                    await giveaway_cog.db.execute(
-                        """
-                        INSERT INTO participants
-                        (message_id, user_id, joined_at, is_forced, is_fake, original_user_id)
-                        VALUES (?, ?, ?, 1, 0, NULL)
-                        """,
-                        (message_id, uid, get_current_utc_timestamp()),
-                    )
+                    try:
+                        await giveaway_cog.db.participants.insert_one({
+                            "message_id": message_id,
+                            "user_id": uid,
+                            "joined_at": get_current_utc_timestamp(),
+                            "is_forced": 1,
+                            "is_fake": 0,
+                            "original_user_id": None
+                        })
+                    except Exception as e:
+                        # Handle duplicate key error (race condition)
+                        if "duplicate key" not in str(e).lower():
+                            self.logger.error(f"Error inserting forced winner: {e}")
                 else:
                     # Update existing entry to mark as forced
-                    await giveaway_cog.db.execute(
-                        """
-                        UPDATE participants
-                        SET is_forced = 1
-                        WHERE message_id = ? AND user_id = ?
-                        """,
-                        (message_id, uid)
+                    await giveaway_cog.db.participants.update_one(
+                        {"message_id": message_id, "user_id": uid},
+                        {"$set": {"is_forced": 1}}
                     )
 
             mentions = ", ".join(f"<@{uid}>" for uid in user_id_list)
@@ -423,13 +448,126 @@ class GiveawayAdminCog(commands.Cog):
                 f"Error setting forced winners: {e}", ephemeral=True
             )
 
-    @discord.app_commands.command(
-        name="cancel_giveaway",
-        description="Cancel an active giveaway"
-    )
-    @discord.app_commands.guild_only()
-    @discord.app_commands.default_permissions(administrator=True)
-    async def cancel_giveaway(
+    async def extend(
+        self,
+        interaction: discord.Interaction,
+        message_id: str,
+        additional_time: str
+    ):
+        """Extend the duration of an active giveaway."""
+        await interaction.response.defer(ephemeral=True)
+        try:
+            giveaway_cog = self.bot.get_cog("GiveawayCog")
+            if (
+                not giveaway_cog
+                or not hasattr(giveaway_cog, "db")
+                or not giveaway_cog.db.connected
+            ):
+                return await interaction.followup.send(
+                    "Giveaway system not available.", ephemeral=True
+                )
+
+            gw = await giveaway_cog.db.giveaways.find_one({
+                "message_id": message_id,
+                "status": "active"
+            })
+            if not gw:
+                return await interaction.followup.send(
+                    "Not an active giveaway.", ephemeral=True
+                )
+
+            channel = self.bot.get_channel(gw["channel_id"])
+            if not channel:
+                return await interaction.followup.send(
+                    "Could not find giveaway channel.", ephemeral=True
+                )
+            
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except Exception as e:
+                return await interaction.followup.send(
+                    f"Couldn't fetch giveaway message: {e}", ephemeral=True
+                )
+
+            # Parse additional time
+            import re
+            from cogs.giveaways.config import DURATION_UNITS
+            pattern = r'(\d+)([smhdw])'
+            matches = re.findall(pattern, additional_time.lower())
+            if not matches:
+                return await interaction.followup.send(
+                    "Invalid time format. Use formats like: 30s, 1h, 1h30m, 2d5h30m, 1w",
+                    ephemeral=True
+                )
+            
+            additional_seconds = sum(int(n) * DURATION_UNITS[u] for n, u in matches)
+            
+            # Calculate new end time
+            new_end_time = gw["end_time"] + additional_seconds
+            
+            # Validate new end time doesn't exceed max duration from creation
+            from cogs.giveaways.config import MAX_GIVEAWAY_DURATION
+            created_at = gw.get("created_at", get_current_utc_timestamp())
+            total_duration = new_end_time - created_at
+            if total_duration > MAX_GIVEAWAY_DURATION:
+                return await interaction.followup.send(
+                    f"Cannot extend: Total duration would exceed maximum allowed ({MAX_GIVEAWAY_DURATION}s).",
+                    ephemeral=True
+                )
+            
+            # Update database
+            await giveaway_cog.db.giveaways.update_one(
+                {"message_id": message_id},
+                {"$set": {"end_time": new_end_time}}
+            )
+
+            # Format duration display
+            def fmt_dur(sec):
+                parts = []
+                for unit_sec, label in [(86400,'d'),(3600,'h'),(60,'m')]:
+                    if sec >= unit_sec:
+                        cnt, sec = divmod(sec, unit_sec)
+                        parts.append(f"{cnt}{label}")
+                if sec:
+                    parts.append(f"{sec}s")
+                return " ".join(parts) or "0s"
+            
+            added_display = fmt_dur(additional_seconds)
+            
+            # Update embed
+            if not message.embeds:
+                return await interaction.followup.send(
+                    "Giveaway message has no embed to update.", ephemeral=True
+                )
+            
+            icon = None
+            if channel.guild and hasattr(channel.guild, 'icon') and channel.guild.icon:
+                icon = channel.guild.icon.url
+            embed = message.embeds[0]
+            prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
+            embed.description = (
+                f"{WINNER_EMOJI} **Winner:** {gw['winners_count']}\n"
+                f"{TIME_EMOJI} **Ends:** <t:{new_end_time}:R>\n"
+                f"{PRIZE_EMOJI} **Hosted by:** <@{gw['host_id']}>"
+            )
+            embed.timestamp = datetime.fromtimestamp(new_end_time, timezone.utc)
+            embed.set_author(name=prize_name, icon_url=icon)
+            
+            await message.edit(embed=embed)
+            
+            await interaction.followup.send(
+                f"✅ Giveaway duration extended by {added_display}!\n"
+                f"New end time: <t:{new_end_time}:F> (<t:{new_end_time}:R>)",
+                ephemeral=True
+            )
+
+        except Exception as e:
+            self.logger.error(f"extend_giveaway error: {e}")
+            await interaction.followup.send(
+                f"Error extending giveaway: {e}", ephemeral=True
+            )
+
+    async def cancel(
         self,
         interaction: discord.Interaction,
         message_id: str,
@@ -448,10 +586,10 @@ class GiveawayAdminCog(commands.Cog):
                     "Giveaway system not available.", ephemeral=True
                 )
 
-            gw = await giveaway_cog.db.fetchone(
-                "SELECT * FROM giveaways WHERE message_id = ? AND status = ?",
-                (message_id, "active"),
-            )
+            gw = await giveaway_cog.db.giveaways.find_one({
+                "message_id": message_id,
+                "status": "active"
+            })
             if not gw:
                 return await interaction.followup.send(
                     "Not an active giveaway.", ephemeral=True
@@ -473,23 +611,35 @@ class GiveawayAdminCog(commands.Cog):
             # Cancel any active fake reaction task
             if message_id in self.active_fake_reaction_tasks:
                 self.active_fake_reaction_tasks[message_id].cancel()
-                await giveaway_cog.db.execute(
-                    "UPDATE fake_reactions SET status = ?, cancelled_at = ? WHERE message_id = ?",
-                    ("cancelled", get_current_utc_timestamp(), message_id),
+                await giveaway_cog.db.fake_reactions.update_one(
+                    {"message_id": message_id},
+                    {"$set": {
+                        "status": "cancelled",
+                        "cancelled_at": get_current_utc_timestamp()
+                    }}
                 )
 
             # Update giveaway status
             now_ts = get_current_utc_timestamp()
-            await giveaway_cog.db.execute(
-                "UPDATE giveaways SET status = ?, cancelled_at = ?, cancelled_by = ?, error = ? WHERE message_id = ?",
-                ("cancelled", now_ts, interaction.user.id, reason, message_id),
+            await giveaway_cog.db.giveaways.update_one(
+                {"message_id": message_id},
+                {"$set": {
+                    "status": "cancelled",
+                    "cancelled_at": now_ts,
+                    "cancelled_by": interaction.user.id,
+                    "error": reason
+                }}
             )
 
             # Update embed
-            icon = channel.guild.icon.url if channel.guild and channel.guild.icon else None
+            icon = None
+            if channel.guild and hasattr(channel.guild, 'icon') and channel.guild.icon:
+                icon = channel.guild.icon.url
+            prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
             embed = discord.Embed(
+                title=f"{GIFT_EMOJI} {prize_name}",
                 description=(
-                    f"{RED_DOT_EMOJI} **CANCELLED**\n"
+                    f">>> {RED_DOT_EMOJI} **CANCELLED**\n"
                     f"{DOT_EMOJI} Reason: {reason}\n"
                     f"{DOT_EMOJI} Cancelled by: {interaction.user.mention}\n"
                     f"{DOT_EMOJI} Hosted by: <@{gw['host_id']}>"
@@ -497,11 +647,15 @@ class GiveawayAdminCog(commands.Cog):
                 color=0xFF0000,  # Red color for cancelled
                 timestamp=datetime.fromtimestamp(now_ts, timezone.utc)
             )
-            prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
-            embed.set_author(name=f"[CANCELLED] {prize_name}", icon_url=icon)
-
-            await message.clear_reactions()
+            if icon:
+                embed.set_footer(text=channel.guild.name, icon_url=icon)
+            
             await message.edit(embed=embed, view=None)
+            
+            # Clean up cache entry for cancelled giveaway
+            if hasattr(giveaway_cog, '_cache_lock') and hasattr(giveaway_cog, '_participant_cache'):
+                async with giveaway_cog._cache_lock:
+                    giveaway_cog._participant_cache.pop(message_id, None)
             
             await interaction.followup.send(
                 f"✅ Giveaway cancelled successfully.\nReason: {reason}",

@@ -3,6 +3,7 @@
 import os
 import logging
 import time
+import asyncio
 from datetime import datetime, timezone
 from collections import defaultdict
 
@@ -10,7 +11,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands, Interaction, TextChannel
 from discord.app_commands import checks
-from pymongo import MongoClient, ASCENDING
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ASCENDING
 from pymongo.errors import DuplicateKeyError
 
 logger = logging.getLogger(__name__)
@@ -20,14 +22,24 @@ class ThreadCreatorCog(commands.Cog):
         self.bot = bot
 
         # MongoDB setup - use shared client if available, otherwise create new
-        if hasattr(bot, 'mongo_client'):
+        if hasattr(bot, 'mongo_client') and bot.mongo_client:
             self.mongo_client = bot.mongo_client
             self._owns_client = False
         else:
             mongo_uri = os.getenv("MONGO_URL")
             if not mongo_uri:
                 raise ValueError("MONGO_URL is not set in the environment variables.")
-            self.mongo_client = MongoClient(mongo_uri)
+            self.mongo_client = AsyncIOMotorClient(
+                mongo_uri,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=10000,
+                socketTimeoutMS=45000,
+                maxPoolSize=50,
+                minPoolSize=5,
+                maxIdleTimeMS=45000,
+                retryWrites=True,
+                retryReads=True
+            )
             self._owns_client = True
         
         self.db = self.mongo_client["threads"]
@@ -42,21 +54,21 @@ class ThreadCreatorCog(commands.Cog):
             "last_refill": time.time()
         })
         
-        # Create indexes for better performance
-        self._ensure_indexes()
+        # Create indexes for better performance - schedule as async task
+        bot.loop.create_task(self._ensure_indexes())
 
-    def _ensure_indexes(self):
+    async def _ensure_indexes(self):
         """Create database indexes if they don't exist."""
         try:
             # Compound index for guild_configs
-            self.guild_configs.create_index(
+            await self.guild_configs.create_index(
                 [("guild_id", ASCENDING), ("channel_id", ASCENDING)],
                 unique=True,
                 background=True
             )
             
             # Compound index for cooldowns
-            self.cooldowns.create_index(
+            await self.cooldowns.create_index(
                 [("guild_id", ASCENDING), ("user_id", ASCENDING)],
                 unique=True,
                 background=True
@@ -64,7 +76,7 @@ class ThreadCreatorCog(commands.Cog):
             
             # TTL index to auto-delete old cooldown entries after 24 hours
             try:
-                self.cooldowns.create_index(
+                await self.cooldowns.create_index(
                     "last_used",
                     expireAfterSeconds=86400,
                     background=True
@@ -72,8 +84,8 @@ class ThreadCreatorCog(commands.Cog):
             except Exception as idx_error:
                 # If index exists with different options, drop and recreate
                 if "IndexOptionsConflict" in str(idx_error) or "already exists" in str(idx_error):
-                    self.cooldowns.drop_index("last_used_1")
-                    self.cooldowns.create_index(
+                    await self.cooldowns.drop_index("last_used_1")
+                    await self.cooldowns.create_index(
                         "last_used",
                         expireAfterSeconds=86400,
                         background=True
@@ -82,10 +94,11 @@ class ThreadCreatorCog(commands.Cog):
                     raise
             
             # Index for stats queries
-            self.stats.create_index(
+            await self.stats.create_index(
                 [("guild_id", ASCENDING), ("date", ASCENDING)],
                 background=True
             )
+            logger.info("Thread indexes created successfully")
         except Exception as e:
             logger.error(f"Error creating indexes: {e}")
 
@@ -122,10 +135,10 @@ class ThreadCreatorCog(commands.Cog):
         
         return False
 
-    def is_on_cooldown(self, guild_id: str, user_id: str, cooldown: int) -> tuple[bool, float]:
+    async def is_on_cooldown(self, guild_id: str, user_id: str, cooldown: int) -> tuple[bool, float]:
         """Check if user is on cooldown. Returns (is_on_cooldown, time_remaining)."""
         now = datetime.now(timezone.utc)
-        entry = self.cooldowns.find_one({"guild_id": guild_id, "user_id": user_id})
+        entry = await self.cooldowns.find_one({"guild_id": guild_id, "user_id": user_id})
         
         if entry:
             last_used = entry.get("last_used")
@@ -140,11 +153,11 @@ class ThreadCreatorCog(commands.Cog):
         
         return False, 0
 
-    def update_cooldown(self, guild_id: str, user_id: str):
+    async def update_cooldown(self, guild_id: str, user_id: str):
         """Update the last used timestamp for a user."""
         now = datetime.now(timezone.utc)
         try:
-            self.cooldowns.update_one(
+            await self.cooldowns.update_one(
                 {"guild_id": guild_id, "user_id": user_id},
                 {"$set": {"last_used": now}},
                 upsert=True
@@ -152,11 +165,11 @@ class ThreadCreatorCog(commands.Cog):
         except Exception as e:
             logger.error(f"Error updating cooldown for user {user_id}: {e}")
 
-    def record_stats(self, guild_id: str, channel_id: str, user_id: str):
+    async def record_stats(self, guild_id: str, channel_id: str, user_id: str):
         """Record thread creation statistics."""
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            self.stats.update_one(
+            await self.stats.update_one(
                 {
                     "guild_id": guild_id,
                     "date": today
@@ -199,7 +212,7 @@ class ThreadCreatorCog(commands.Cog):
         user_id = str(message.author.id)
 
         # Check if this channel is configured for thread creation
-        config = self.guild_configs.find_one(
+        config = await self.guild_configs.find_one(
             {"guild_id": guild_id, "channel_id": channel_id}
         )
         
@@ -217,7 +230,7 @@ class ThreadCreatorCog(commands.Cog):
 
         # Check per-user cooldown
         cooldown = config.get("cooldown", 30)
-        on_cd, remaining = self.is_on_cooldown(guild_id, user_id, cooldown)
+        on_cd, remaining = await self.is_on_cooldown(guild_id, user_id, cooldown)
         
         if on_cd:
             try:
@@ -253,14 +266,13 @@ class ThreadCreatorCog(commands.Cog):
                 )
                 
                 # Success! Update cooldown and record stats
-                self.update_cooldown(guild_id, user_id)
-                self.record_stats(guild_id, channel_id, user_id)
+                await self.update_cooldown(guild_id, user_id)
+                await self.record_stats(guild_id, channel_id, user_id)
                 
                 # Send confirmation message in thread
                 try:
                     await thread.send(
-                        f"📎 Thread created by {message.author.mention}",
-                        delete_after=10
+                        f"📎 Thread created by {message.author.mention}"
                     )
                 except discord.Forbidden:
                     pass
@@ -374,14 +386,14 @@ class ThreadCreatorCog(commands.Cog):
         channel_id = str(channel.id)
 
         # Check if already configured
-        existing = self.guild_configs.find_one(
+        existing = await self.guild_configs.find_one(
             {"guild_id": guild_id, "channel_id": channel_id}
         )
         
         if existing:
             # Remove configuration
             try:
-                self.guild_configs.delete_one(
+                await self.guild_configs.delete_one(
                     {"guild_id": guild_id, "channel_id": channel_id}
                 )
                 return await interaction.response.send_message(
@@ -418,7 +430,7 @@ class ThreadCreatorCog(commands.Cog):
 
         # Add new configuration
         try:
-            self.guild_configs.update_one(
+            await self.guild_configs.update_one(
                 {"guild_id": guild_id, "channel_id": channel_id},
                 {"$set": {
                     "cooldown": cooldown,
@@ -460,7 +472,7 @@ class ThreadCreatorCog(commands.Cog):
         guild_id = str(interaction.guild_id)
         
         try:
-            configs = list(self.guild_configs.find({"guild_id": guild_id}))
+            configs = await self.guild_configs.find({"guild_id": guild_id}).to_list(length=None)
         except Exception as e:
             logger.error(f"Error fetching configs: {e}", exc_info=True)
             return await interaction.response.send_message(
@@ -505,7 +517,7 @@ class ThreadCreatorCog(commands.Cog):
             else:
                 # Channel was deleted, clean up config
                 try:
-                    self.guild_configs.delete_one(
+                    await self.guild_configs.delete_one(
                         {"guild_id": guild_id, "channel_id": cfg["channel_id"]}
                     )
                 except Exception as e:
@@ -533,7 +545,7 @@ class ThreadCreatorCog(commands.Cog):
         try:
             # Get today's stats
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            today_stats = self.stats.find_one({
+            today_stats = await self.stats.find_one({
                 "guild_id": guild_id,
                 "date": today
             })
@@ -541,10 +553,10 @@ class ThreadCreatorCog(commands.Cog):
             # Get last 7 days total
             from datetime import timedelta
             week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
-            week_stats = list(self.stats.find({
+            week_stats = await self.stats.find({
                 "guild_id": guild_id,
                 "date": {"$gte": week_ago}
-            }))
+            }).to_list(length=None)
             
             total_week = sum(s.get("total_threads", 0) for s in week_stats)
             total_today = today_stats.get("total_threads", 0) if today_stats else 0
