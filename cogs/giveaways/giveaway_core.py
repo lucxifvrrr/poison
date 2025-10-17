@@ -976,8 +976,10 @@ class GiveawayCog(commands.Cog):
                 return " ".join(parts) or "0s"
             dur_disp = fmt_dur(secs)
             icon = None
-            if interaction.guild and hasattr(interaction.guild, 'icon') and interaction.guild.icon:
+            if interaction.guild and interaction.guild.icon:
                 icon = interaction.guild.icon.url
+            if not icon and FOOTER_ICON_URL:
+                icon = FOOTER_ICON_URL
 
             embed = discord.Embed(
                 title=f"{GIFT_EMOJI} {prize}",
@@ -992,8 +994,9 @@ class GiveawayCog(commands.Cog):
             thumbnail_url = get_thumbnail_url(interaction.guild)
             if thumbnail_url:
                 embed.set_thumbnail(url=thumbnail_url)
-            if icon:
-                embed.set_footer(icon_url=icon)
+            
+            if interaction.guild and interaction.guild.icon:
+                embed.set_footer(text="made with ♡", icon_url=str(interaction.guild.icon))
 
             view = GiveawayJoinView(str(0), self.db, self)  # Temporary message_id
             msg = await interaction.channel.send(embed=embed, view=view)
@@ -1117,8 +1120,10 @@ class GiveawayCog(commands.Cog):
             mentions = [f"<@{w.split('_fake_')[0]}>" for w in verified_winners] or ["No winners."]
             now_ts = get_current_utc_timestamp()
             icon = None
-            if chan.guild and hasattr(chan.guild, 'icon') and chan.guild.icon:
+            if chan.guild and chan.guild.icon:
                 icon = chan.guild.icon.url
+            if not icon and FOOTER_ICON_URL:
+                icon = FOOTER_ICON_URL
 
             prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
             embed = discord.Embed(
@@ -1134,8 +1139,9 @@ class GiveawayCog(commands.Cog):
             thumbnail_url = get_thumbnail_url(chan.guild)
             if thumbnail_url:
                 embed.set_thumbnail(url=thumbnail_url)
-            if icon:
-                embed.set_footer(icon_url=icon)
+            
+            if chan.guild and chan.guild.icon:
+                embed.set_footer(text="made with ♡", icon_url=str(chan.guild.icon))
 
             view = GiveawayEndedView(total_participants, message_id, self.db, self.bot)
             
@@ -1241,8 +1247,7 @@ class GiveawayCog(commands.Cog):
             thumbnail_url = get_thumbnail_url(ctx.guild)
             if thumbnail_url:
                 embed.set_thumbnail(url=thumbnail_url)
-            if icon:
-                embed.set_footer(text=ctx.guild.name, icon_url=icon)
+            embed.set_footer(icon_url=FOOTER_ICON_URL)
 
             view = GiveawayEndedView(total_participants, str(orig.id), self.db, self.bot)
             await orig.edit(embed=embed, view=view)
@@ -1376,8 +1381,13 @@ class GiveawayCog(commands.Cog):
             
             # Get server icon
             icon = None
-            if ctx.guild and hasattr(ctx.guild, 'icon') and ctx.guild.icon:
+            if ctx.guild and ctx.guild.icon:
                 icon = ctx.guild.icon.url
+            if not icon and FOOTER_ICON_URL:
+                icon = FOOTER_ICON_URL
+            
+            # Send giveaway announcement
+            await ctx.send("**<:sukoon_taaada:1324071825910792223> GIVEAWAY <:sukoon_taaada:1324071825910792223>**")
             
             # Create embed
             winners_text = f"{winners} {'winner' if winners == 1 else 'winners'}"
@@ -1394,9 +1404,10 @@ class GiveawayCog(commands.Cog):
             thumbnail_url = get_thumbnail_url(ctx.guild)
             if thumbnail_url:
                 embed.set_thumbnail(url=thumbnail_url)
-            if icon:
-                embed.set_footer(icon_url=icon)
             
+            if ctx.guild and ctx.guild.icon:
+                embed.set_footer(text="made with ♡", icon_url=str(ctx.guild.icon))
+
             view = GiveawayJoinView(str(0), self.db, self)
             msg = await ctx.send(embed=embed, view=view)
             

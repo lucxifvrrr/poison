@@ -32,7 +32,7 @@ GIFT_EMOJI = "<a:ogs_gift:1428659726790426686>"  # Gift emoji for giveaway title
 GIVEAWAY_THUMBNAIL_URL = "https://images-ext-1.discordapp.net/external/7RBwotHDp9qC1T5jYqRrwYTE_QQk7jAsJTiYkJ5DAyo/https/i.postimg.cc/j5x98YMw/1f381.gif?width=640&height=640"
 
 # Footer icon URL for giveaway embeds
-FOOTER_ICON_URL = "https://media.discordapp.net/attachments/1428636041538965607/1428647953496539227/b8b7454ac714509f8c173209f79496a9-removebg-preview.png?ex=68f34397&is=68f1f217&hm=1bf6af4e38895881c2f8cda30ed0a973c8a8abcf68be53bcd1a9baed38974f92&=&format=webp&quality=lossless&width=625&height=625"
+FOOTER_ICON_URL = "https://media.discordapp.net/attachments/1428636041538965607/1428647953496539227/b8b7454ac714509f8c173209f79496a9-removebg-preview.png"
 
 # Color constants
 EMBED_COLOR = 0x2f3136
