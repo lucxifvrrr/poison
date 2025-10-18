@@ -296,10 +296,25 @@ class ImprovedMuteCog(commands.Cog):
         # Administrators can target anyone except owner
         if actor.guild_permissions.administrator:
             return True, None
-        
+            
+        # Get the config to check mod role
+        cfg = guild_configs.find_one({"guild_id": guild.id})
+        if cfg:
+            mod_role_id = cfg.get("mod_role_id")
+            if mod_role_id:
+                mod_role = guild.get_role(mod_role_id)
+                if mod_role and mod_role in actor.roles:
+                    # Allow moderators to target members below the mod role
+                    if target.top_role < mod_role:
+                        return True, None
+                    elif target.top_role == mod_role:
+                        return False, "Cannot moderate other moderators"
+                        
         # For non-admins, check role hierarchy
         if target.top_role >= actor.top_role:
-            return False, "You cannot act on a member with an equal or higher top role."
+            return False, "You cannot act on a member with an equal or higher role than you."
+            
+        return True, None
         
         return True, None
 
@@ -646,6 +661,11 @@ class ImprovedMuteCog(commands.Cog):
     async def setmodrole(self, ctx: commands.Context, role: discord.Role):
         if not ctx.guild:
             return await ctx.send("Use this command inside a server.")
+        
+        # Check if the role is suitable for moderation
+        if role >= ctx.guild.me.top_role:
+            return await ctx.send("<:alert:1426440385269338164> The moderator role must be lower than my highest role!")
+        
         guild_configs.update_one({"guild_id": ctx.guild.id}, {"$set": {"mod_role_id": role.id}}, upsert=True)
         embed = discord.Embed(
             title="<a:white_tick:1426439810733572136> Moderator Role Updated",
@@ -697,7 +717,10 @@ class ImprovedMuteCog(commands.Cog):
             mod_role_id = cfg.get("mod_role_id")
             if mod_role_id:
                 mr = guild.get_role(mod_role_id)
-                if mr and mr in ctx.author.roles:
+                # Check if moderator role exists and user has it
+                if not mr:
+                    return await ctx.send("<:alert:1426440385269338164> Moderator role not found or has been deleted. Ask an admin to set it up again.")
+                if mr in ctx.author.roles:
                     allowed = True
         if not allowed:
             return await ctx.send("You don't have permission to use this command.")
@@ -714,15 +737,15 @@ class ImprovedMuteCog(commands.Cog):
         if member.bot:
             return await ctx.send("<:alert:1426440385269338164> Cannot mute bots.")
 
+        # bot feasibility check first (to avoid confusing error messages)
+        can_manage, why = await self._can_manage_member(guild, member)
+        if not can_manage:
+            return await ctx.send(f"<:alert:1426440385269338164> I cannot mute that member: {why}")
+
         # actor vs target hierarchy
         ok, why = self._actor_can_target(guild, ctx.author, member)
         if not ok:
             return await ctx.send(f"<:alert:1426440385269338164> You cannot mute that member: {why}")
-
-        # bot feasibility
-        can_manage, why = await self._can_manage_member(guild, member)
-        if not can_manage:
-            return await ctx.send(f"<:alert:1426440385269338164> I cannot mute that member: {why}")
 
         # Parse duration and reason (much simpler now)
         expires_at = None
