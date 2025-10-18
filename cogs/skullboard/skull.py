@@ -198,6 +198,7 @@ class Skullboard(commands.Cog):
             "config": {},
             "mapping": {}
         }
+        
         # run ensure indexes and start cleanup task
         bot.loop.create_task(ensure_indexes())
         bot.loop.create_task(self._cleanup_loop())
@@ -464,7 +465,7 @@ class Skullboard(commands.Cog):
         guild_id = payload.guild_id
         rate_key = f"rate_limit_{guild_id}"
         now = time.time()
-        if hasattr(self, rate_key) and now - getattr(self, rate_key) < 0.5:  # 500ms cooldown per guild
+        if hasattr(self, rate_key) and now - getattr(self, rate_key) < 1.0:  # 1 second cooldown per guild
             return
         setattr(self, rate_key, now)
         guild = self.bot.get_guild(payload.guild_id)
@@ -553,11 +554,17 @@ class Skullboard(commands.Cog):
                         # update
                         try:
                             skull_msg = await skull_channel.fetch_message(exists_skull_msg_id)
-                            count_msg = f"**{current_count}** {cfg.emoji} | #{message.channel.name}"
-                            await skull_msg.edit(content=count_msg, embed=embed)
+                            count_msg = f"**{current_count}** {cfg.emoji} | {message.channel.mention}"
+                            try:
+                                await skull_msg.edit(content=count_msg, embed=embed)
+                            except discord.HTTPException as e:
+                                if e.status == 429:  # Rate limited
+                                    print(f"Rate limited while updating skull message {exists_skull_msg_id}, will retry later")
+                                    return
+                                raise
                         except discord.NotFound:
                             # create new if missing
-                            count_msg = f"**{current_count}** {cfg.emoji} | #{message.channel.name}"
+                            count_msg = f"**{current_count}** {cfg.emoji} | {message.channel.mention}"
                             sent = await skull_channel.send(content=count_msg, embed=embed)
                             # Add skull reaction to the new post
                             try:
@@ -589,7 +596,7 @@ class Skullboard(commands.Cog):
                                         print(f"Error counting reactors: {e}")
                     else:
                         # create new post with count and channel name first, then embed
-                        count_msg = f"**{current_count}** {cfg.emoji} | #{message.channel.name}"
+                        count_msg = f"**{current_count}** {cfg.emoji} | {message.channel.mention}"
                         sent = await skull_channel.send(content=count_msg, embed=embed)
                         # Add skull reaction to the skullboard post
                         try:
@@ -624,7 +631,13 @@ class Skullboard(commands.Cog):
                     try:
                         skull_msg = await skull_channel.fetch_message(exists_skull_msg_id)
                         embed = self.build_skull_embed(message, current_count, guild, qualified=False, cfg=cfg)
-                        await skull_msg.edit(embed=embed)
+                        try:
+                            await skull_msg.edit(embed=embed)
+                        except discord.HTTPException as e:
+                            if e.status == 429:  # Rate limited
+                                print(f"Rate limited while marking skull message {exists_skull_msg_id} as unqualified")
+                                return
+                            raise
                     except discord.NotFound:
                         # mapping stale; remove
                         await self.remove_mapping(guild.id, message.id)
@@ -822,16 +835,24 @@ class Skullboard(commands.Cog):
         """Handle message edits with proper error handling and content change detection"""
         if not getattr(payload, "guild_id", None):
             return
+        
+        # Add rate limiting per guild (same as reaction handler)
+        guild_id = payload.guild_id
+        rate_key = f"edit_rate_limit_{guild_id}"
+        now = time.time()
+        if hasattr(self, rate_key) and now - getattr(self, rate_key) < 1.0:  # 1 second cooldown for edits
+            return
+        setattr(self, rate_key, now)
             
-        guild = self.bot.get_guild(payload.guild_id)
+        guild = self.bot.get_guild(guild_id)
         if not guild:
             return
             
-        cfg = await self.load_config(payload.guild_id)
+        cfg = await self.load_config(guild_id)
         if not cfg:
             return
             
-        mapping = await self.get_map(payload.guild_id)
+        mapping = await self.get_map(guild_id)
         skull_msg_id = mapping.get(payload.message_id)
         if not skull_msg_id:
             return
@@ -871,9 +892,15 @@ class Skullboard(commands.Cog):
                     skull_msg = await skull_channel.fetch_message(skull_msg_id)
                     qualified = current_count >= cfg.threshold
                     
-                    # Update the skull message
+                    # Update the skull message with retry logic
                     embed = self.build_skull_embed(message, current_count, guild, qualified, cfg)
-                    await skull_msg.edit(embed=embed)
+                    try:
+                        await skull_msg.edit(embed=embed)
+                    except discord.HTTPException as e:
+                        if e.status == 429:  # Rate limited
+                            print(f"Rate limited while editing skull message {skull_msg_id}, skipping update")
+                            return
+                        raise
                     
                 except discord.NotFound:
                     # If skull message is missing but should exist, recreate it
@@ -898,45 +925,26 @@ class Skullboard(commands.Cog):
             except Exception as e:
                 print(f"Error processing message edit: {e}")
 
-    # ----------------- Single Slash Command (All-in-one) -----------------
-    skull_group = app_commands.Group(name="setup-skullboard", description="Configure and manage the Skullboard (admin only)")
-
-    @skull_group.command(name="run", description="Configure and manage skullboard settings (admin only)")
+    # ----------------- Slash Commands -----------------
+    @app_commands.command(name="setup-skullboard", description="Configure skullboard settings (admin only)")
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(
-        target_channel="Existing channel where skullboard posts will appear (set or update)",
+        target_channel="Channel where skullboard posts will appear (required for first setup)",
         emoji="Emoji to use as skull trigger (unicode or custom). Default is 💀",
         threshold="Number of reactions required to post (default 2)",
         style="Embed style: compact or detailed",
         autothread="Auto-create a discussion thread for each skullboard post",
-        milestones="Enable/disable milestone announcements (10/25/50)",
-        blacklist_user="Toggle blacklist for a user (add if missing, remove if present)",
-        blacklist_channel="Toggle blacklist for a channel (add if missing, remove if present)",
-        show_leaderboard="Show top authors and reactors here",
-        rebuild="Resync skullboard mappings (recount reactions for mapped messages)",
-        reset="Reset (delete) skullboard configuration for this guild"
+        milestones="Enable/disable milestone announcements (10/25/50)"
     )
-    async def run(self,
+    async def skullboard(self,
                   interaction:discord.Interaction,
                   target_channel:Optional[discord.TextChannel]=None,
                   emoji:Optional[str]=None,
                   threshold:Optional[int]=None,
                   style:Optional[str]=None,
                   autothread:Optional[bool]=None,
-                  milestones:Optional[bool]=None,
-                  blacklist_user:Optional[discord.Member]=None,
-                  blacklist_channel:Optional[discord.TextChannel]=None,
-                  show_leaderboard:Optional[bool]=None,
-                  rebuild:Optional[bool]=None,
-                  reset:Optional[bool]=None):
-        """
-        This single command handles:
-        - initial configuration (channel, emoji, threshold, style, autothread, milestones)
-        - toggling blacklist for users/channels
-        - showing leaderboard
-        - rebuild/resync
-        - resetting configuration
-        """
+                  milestones:Optional[bool]=None):
+        """Configure skullboard settings for your server."""
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if not guild:
@@ -945,127 +953,7 @@ class Skullboard(commands.Cog):
         # load existing config if any
         cfg = await self.load_config(guild.id)
 
-        # Handle reset first
-        if reset:
-            await self.delete_config(guild.id)
-            return await interaction.followup.send("Skullboard configuration and data have been deleted for this server.", ephemeral=True)
-
-        # Blacklist toggle user
-        if blacklist_user:
-            toggled_on = await self.toggle_blacklist_user(guild.id, blacklist_user.id)
-            state = "added to" if toggled_on else "removed from"
-            return await interaction.followup.send(f"{blacklist_user.mention} {state} blacklist.", ephemeral=True)
-
-        # Blacklist toggle channel
-        if blacklist_channel:
-            toggled_on = await self.toggle_blacklist_channel(guild.id, blacklist_channel.id)
-            state = "added to" if toggled_on else "removed from"
-            return await interaction.followup.send(f"{blacklist_channel.mention} {state} blacklist.", ephemeral=True)
-
-        # Show leaderboard
-        if show_leaderboard:
-            if not cfg:
-                return await interaction.followup.send("No skullboard configured for this server.", ephemeral=True)
-            top_authors = await self.get_top_stats(guild.id, "author", limit=10)
-            top_reactors = await self.get_top_stats(guild.id, "reactor", limit=10)
-            embed = Embed(title="Skullboard Leaderboard", colour=Colour(EMBED_COLOR))
-            if top_authors:
-                lines = []
-                for idx, (uid, score) in enumerate(top_authors, start=1):
-                    member = guild.get_member(uid) or await self.bot.fetch_user(uid)
-                    name = getattr(member, "display_name", getattr(member, "name", str(uid)))
-                    lines.append(f"**{idx}.** {name} — {score} skullposts")
-                embed.add_field(name="Top Skullboarded Authors", value="\n".join(lines), inline=False)
-            else:
-                embed.add_field(name="Top Skullboarded Authors", value="No data", inline=False)
-            if top_reactors:
-                lines = []
-                for idx, (uid, score) in enumerate(top_reactors, start=1):
-                    member = guild.get_member(uid) or await self.bot.fetch_user(uid)
-                    name = getattr(member, "display_name", getattr(member, "name", str(uid)))
-                    lines.append(f"**{idx}.** {name} — {score} skulls given")
-                embed.add_field(name="Top Skull Reactors", value="\n".join(lines), inline=False)
-            else:
-                embed.add_field(name="Top Skull Reactors", value="No data", inline=False)
-            embed.set_footer(text=pick_footer(guild.name))
-            return await interaction.followup.send(embed=embed, ephemeral=False)
-
-        # Rebuild/resync
-        if rebuild:
-            if not cfg:
-                return await interaction.followup.send("No skullboard configured for this server to rebuild.", ephemeral=True)
-            await interaction.followup.send("Resyncing mapped messages — this may take a moment...", ephemeral=True)
-            # For each mapping, fetch original message and recount configured emoji reactions and update skull posts accordingly
-            mapping = await self.get_map(guild.id)
-            updated = 0
-            removed = 0
-            async with self.get_lock(guild.id):  # Prevent race conditions during rebuild
-                for orig_id, skull_id in list(mapping.items()):
-                    try:
-                        # we only attempt to fetch original message if channel exists
-                        # We need channel id; the mapping doc doesn't contain it; we will try to search channels for the message
-                        # For performance, try to fetch message from guild via channels (expensive) - we'll try known channels by iterating guild.text_channels
-                        orig_msg = None
-                        for ch in guild.text_channels:
-                            try:
-                                orig_msg = await ch.fetch_message(orig_id)
-                                if orig_msg:
-                                    break
-                            except Exception as e:
-                                print(f"Error checking channel {ch.id}: {e}")
-                                continue
-                                
-                        if not orig_msg:
-                            # original missing -> delete skull post
-                            skull_ch = guild.get_channel(cfg.channel_id)
-                            if skull_ch:
-                                try:
-                                    skull_msg = await skull_ch.fetch_message(skull_id)
-                                    await skull_msg.delete()
-                                    removed += 1
-                                except Exception as e:
-                                    print(f"Error deleting skull message {skull_id}: {e}")
-                            await self.remove_mapping(guild.id, orig_id)
-                            continue
-                            
-                        # recount reactions
-                        count = 0
-                        for r in orig_msg.reactions:
-                            try:
-                                if emoji_matches_cfg(r.emoji, cfg.emoji):
-                                    count = r.count
-                                    break
-                            except Exception as e:
-                                print(f"Error checking reaction: {e}")
-                                continue
-                                
-                        # update skull message
-                        skull_ch = guild.get_channel(cfg.channel_id)
-                        if skull_ch:
-                            try:
-                                skull_msg = await skull_ch.fetch_message(skull_id)
-                                embed = self.build_skull_embed(orig_msg, count, guild, count >= cfg.threshold, cfg)
-                                await skull_msg.edit(embed=embed)
-                                updated += 1
-                            except discord.NotFound:
-                                if count >= cfg.threshold:
-                                    # Recreate if message qualifies
-                                    embed = self.build_skull_embed(orig_msg, count, guild, True, cfg)
-                                    new_skull_msg = await skull_ch.send(embed=embed)
-                                    await self.set_mapping(guild.id, orig_id, new_skull_msg.id)
-                                    updated += 1
-                                else:
-                                    await self.remove_mapping(guild.id, orig_id)
-                                    removed += 1
-                            except Exception as e:
-                                print(f"Error updating skull message {skull_id}: {e}")
-                                
-                    except Exception as e:
-                        print(f"Error processing mapping {orig_id} -> {skull_id}: {e}")
-                        continue
-            return await interaction.followup.send(f"Rebuild completed — updated {updated} skullboard posts.", ephemeral=True)
-
-        # Configuration / update path (set channel, emoji, threshold, style, autothread, milestones)
+        # Configuration / update path
         if target_channel or emoji or threshold or style is not None or autothread is not None or milestones is not None:
             # must choose channel from provided option or existing config
             if not target_channel and not cfg:
@@ -1101,30 +989,234 @@ class Skullboard(commands.Cog):
                 cfg.milestones_enabled = milestones
             await self.save_config(cfg)
             return await interaction.followup.send(
-                f"Skullboard configured/updated:\nChannel: {target_channel.mention}\nEmoji: `{cfg.emoji}`\nThreshold: {cfg.threshold}\nStyle: {cfg.style}\nAuto-thread: {cfg.autothread}\nMilestones: {cfg.milestones_enabled}",
+                f"✅ **Skullboard Configured!**\n\n"
+                f"**Channel:** {target_channel.mention}\n"
+                f"**Emoji:** {cfg.emoji}\n"
+                f"**Threshold:** {cfg.threshold} reactions\n"
+                f"**Style:** {cfg.style}\n"
+                f"**Auto-thread:** {cfg.autothread}\n"
+                f"**Milestones:** {cfg.milestones_enabled}\n\n"
+                f"💡 Use `/skullboard-manage` for leaderboard, blacklist, and other management options.",
                 ephemeral=True
             )
 
-        # If no arguments matched, return help summary
-        help_msg = (
-            "Use `/setup-skullboard` with options to configure or manage.\n"
-            "- Provide `target_channel` to set where skullboard posts appear.\n"
-            "- Use `emoji`, `threshold`, `style` (compact/detailed), `autothread`, `milestones` to configure.\n"
-            "- Use `blacklist_user` / `blacklist_channel` to toggle blacklists.\n"
-            "- Use `show_leaderboard` to display leaderboard here.\n"
-            "- Use `rebuild` to resync mapped messages.\n"
-            "- Use `reset` to remove configuration and data."
-        )
-        return await interaction.followup.send(help_msg, ephemeral=True)
+        # Show current config if no parameters provided
+        if cfg:
+            channel = guild.get_channel(cfg.channel_id)
+            channel_mention = channel.mention if channel else f"<#{cfg.channel_id}> (deleted)"
+            return await interaction.followup.send(
+                f"📋 **Current Skullboard Configuration**\n\n"
+                f"**Channel:** {channel_mention}\n"
+                f"**Emoji:** {cfg.emoji}\n"
+                f"**Threshold:** {cfg.threshold} reactions\n"
+                f"**Style:** {cfg.style}\n"
+                f"**Auto-thread:** {cfg.autothread}\n"
+                f"**Milestones:** {cfg.milestones_enabled}\n\n"
+                f"💡 Use `/skullboard-manage` for leaderboard, blacklist, rebuild, and reset options.",
+                ephemeral=True
+            )
+        else:
+            return await interaction.followup.send(
+                f"❌ **No Skullboard Configured**\n\n"
+                f"To set up skullboard, use:\n"
+                f"`/skullboard target_channel:#your-channel`\n\n"
+                f"**Optional parameters:**\n"
+                f"• `emoji` - Reaction emoji to track (default: 💀)\n"
+                f"• `threshold` - Reactions needed (default: 2)\n"
+                f"• `style` - detailed or compact (default: detailed)\n"
+                f"• `autothread` - Auto-create threads (default: false)\n"
+                f"• `milestones` - Enable milestones (default: true)",
+                ephemeral=True
+            )
 
-    @commands.Cog.listener()
-    async def on_ready(self):
-        # register the command group if not already present
-        try:
-            self.bot.tree.add_command(self.skull_group)
-        except Exception:
-            pass
+    @app_commands.command(name="skullboard-manage", description="Manage skullboard (leaderboard, blacklist, rebuild, reset)")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(
+        action="Choose an action to perform",
+        user="User to blacklist/unblacklist (for blacklist action)",
+        channel="Channel to blacklist/unblacklist (for blacklist action)"
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="Show Leaderboard", value="leaderboard"),
+        app_commands.Choice(name="Blacklist/Unblacklist User", value="blacklist_user"),
+        app_commands.Choice(name="Blacklist/Unblacklist Channel", value="blacklist_channel"),
+        app_commands.Choice(name="Rebuild/Resync Messages", value="rebuild"),
+        app_commands.Choice(name="Reset Configuration", value="reset")
+    ])
+    async def skullboard_manage(self,
+                               interaction: discord.Interaction,
+                               action: app_commands.Choice[str],
+                               user: Optional[discord.Member] = None,
+                               channel: Optional[discord.TextChannel] = None):
+        """Manage skullboard settings and data."""
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        if not guild:
+            return await interaction.followup.send("This command must be used in a server (guild).", ephemeral=True)
+
+        cfg = await self.load_config(guild.id)
+        
+        # Handle reset
+        if action.value == "reset":
+            if not cfg:
+                return await interaction.followup.send("❌ No skullboard configured to reset.", ephemeral=True)
+            await self.delete_config(guild.id)
+            return await interaction.followup.send("✅ Skullboard configuration and data have been deleted for this server.", ephemeral=True)
+        
+        # Handle blacklist user
+        if action.value == "blacklist_user":
+            if not user:
+                return await interaction.followup.send("❌ Please provide a user to blacklist/unblacklist.", ephemeral=True)
+            toggled_on = await self.toggle_blacklist_user(guild.id, user.id)
+            state = "added to" if toggled_on else "removed from"
+            return await interaction.followup.send(f"✅ {user.mention} {state} blacklist.", ephemeral=True)
+        
+        # Handle blacklist channel
+        if action.value == "blacklist_channel":
+            if not channel:
+                return await interaction.followup.send("❌ Please provide a channel to blacklist/unblacklist.", ephemeral=True)
+            toggled_on = await self.toggle_blacklist_channel(guild.id, channel.id)
+            state = "added to" if toggled_on else "removed from"
+            return await interaction.followup.send(f"✅ {channel.mention} {state} blacklist.", ephemeral=True)
+        
+        # Handle leaderboard
+        if action.value == "leaderboard":
+            if not cfg:
+                return await interaction.followup.send("❌ No skullboard configured for this server.", ephemeral=True)
+            top_authors = await self.get_top_stats(guild.id, "author", limit=10)
+            top_reactors = await self.get_top_stats(guild.id, "reactor", limit=10)
+            embed = Embed(title="💀 Skull Leaderboard", colour=Colour(EMBED_COLOR))
+            if top_authors:
+                lines = []
+                for idx, (uid, score) in enumerate(top_authors, start=1):
+                    member = guild.get_member(uid) or await self.bot.fetch_user(uid)
+                    name = getattr(member, "display_name", getattr(member, "name", str(uid)))
+                    lines.append(f"**{idx}.** {name} — {score} skullposts")
+                embed.add_field(name="Top Skullboarded Authors", value="\n".join(lines), inline=False)
+            else:
+                embed.add_field(name="Top Skullboarded Authors", value="No data", inline=False)
+            if top_reactors:
+                lines = []
+                for idx, (uid, score) in enumerate(top_reactors, start=1):
+                    member = guild.get_member(uid) or await self.bot.fetch_user(uid)
+                    name = getattr(member, "display_name", getattr(member, "name", str(uid)))
+                    lines.append(f"**{idx}.** {name} — {score} skulls given")
+                embed.add_field(name="Top Skull Reactors", value="\n".join(lines), inline=False)
+            else:
+                embed.add_field(name="Top Skull Reactors", value="No data", inline=False)
+            embed.set_footer(text=pick_footer(guild.name))
+            return await interaction.followup.send(embed=embed, ephemeral=False)
+        
+        # Handle rebuild
+        if action.value == "rebuild":
+            if not cfg:
+                return await interaction.followup.send("No skullboard configured for this server to rebuild.", ephemeral=True)
+            await interaction.followup.send("Resyncing mapped messages — this may take a moment...", ephemeral=True)
+            # For each mapping, fetch original message and recount configured emoji reactions and update skull posts accordingly
+            mapping = await self.get_map(guild.id)
+            updated = 0
+            removed = 0
+            async with self.get_lock(guild.id):  # Prevent race conditions during rebuild
+                for idx, (orig_id, skull_id) in enumerate(list(mapping.items())):
+                    try:
+                        # Add delay every 5 messages to avoid rate limits
+                        if idx > 0 and idx % 5 == 0:
+                            await asyncio.sleep(2)  # 2 second delay every 5 messages
+                        
+                        # we only attempt to fetch original message if channel exists
+                        # We need channel id; the mapping doc doesn't contain it; we will try to search channels for the message
+                        # For performance, try to fetch message from guild via channels (expensive) - we'll try known channels by iterating guild.text_channels
+                        orig_msg = None
+                        for ch in guild.text_channels:
+                            try:
+                                orig_msg = await ch.fetch_message(orig_id)
+                                if orig_msg:
+                                    break
+                            except discord.NotFound:
+                                continue
+                            except discord.HTTPException as e:
+                                if e.status == 429:  # Rate limited
+                                    print(f"Rate limited while searching for message {orig_id}, waiting...")
+                                    await asyncio.sleep(5)
+                                    continue
+                                print(f"HTTP error checking channel {ch.id}: {e}")
+                                continue
+                            except Exception as e:
+                                print(f"Error checking channel {ch.id}: {e}")
+                                continue
+                                
+                        if not orig_msg:
+                            # original missing -> delete skull post
+                            skull_ch = guild.get_channel(cfg.channel_id)
+                            if skull_ch:
+                                try:
+                                    skull_msg = await skull_ch.fetch_message(skull_id)
+                                    await skull_msg.delete()
+                                    removed += 1
+                                except Exception as e:
+                                    print(f"Error deleting skull message {skull_id}: {e}")
+                            await self.remove_mapping(guild.id, orig_id)
+                            continue
+                            
+                        # recount reactions
+                        count = 0
+                        for r in orig_msg.reactions:
+                            try:
+                                if emoji_matches_cfg(r.emoji, cfg.emoji):
+                                    count = r.count
+                                    break
+                            except Exception as e:
+                                print(f"Error checking reaction: {e}")
+                                continue
+                                
+                        # update skull message
+                        skull_ch = guild.get_channel(cfg.channel_id)
+                        if skull_ch:
+                            try:
+                                skull_msg = await skull_ch.fetch_message(skull_id)
+                                embed = self.build_skull_embed(orig_msg, count, guild, count >= cfg.threshold, cfg)
+                                try:
+                                    await skull_msg.edit(embed=embed)
+                                    updated += 1
+                                except discord.HTTPException as e:
+                                    if e.status == 429:  # Rate limited
+                                        print(f"Rate limited while updating skull message {skull_id}, waiting...")
+                                        await asyncio.sleep(5)
+                                        # Retry once
+                                        try:
+                                            await skull_msg.edit(embed=embed)
+                                            updated += 1
+                                        except Exception:
+                                            print(f"Failed to update after rate limit retry: {skull_id}")
+                                    else:
+                                        raise
+                            except discord.NotFound:
+                                if count >= cfg.threshold:
+                                    # Recreate if message qualifies
+                                    embed = self.build_skull_embed(orig_msg, count, guild, True, cfg)
+                                    try:
+                                        new_skull_msg = await skull_ch.send(embed=embed)
+                                        await self.set_mapping(guild.id, orig_id, new_skull_msg.id)
+                                        updated += 1
+                                    except discord.HTTPException as e:
+                                        if e.status == 429:
+                                            print(f"Rate limited while recreating skull message for {orig_id}")
+                                            await asyncio.sleep(5)
+                                        else:
+                                            raise
+                                else:
+                                    await self.remove_mapping(guild.id, orig_id)
+                                    removed += 1
+                            except Exception as e:
+                                print(f"Error updating skull message {skull_id}: {e}")
+                                
+                    except Exception as e:
+                        print(f"Error processing mapping {orig_id} -> {skull_id}: {e}")
+                        continue
+            return await interaction.followup.send(f"✅ Rebuild completed — updated {updated} skullboard posts, removed {removed}.", ephemeral=True)
 
 # Setup function for loading as extension
 async def setup(bot:commands.Bot):
-    await bot.add_cog(Skullboard(bot))
+    cog = Skullboard(bot)
+    await bot.add_cog(cog)
+    print(f"Skullboard cog loaded successfully")

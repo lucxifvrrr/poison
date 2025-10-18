@@ -160,9 +160,9 @@ class GiveawayJoinView(ui.View):
                             item.label = str(new_count)
                             break
                     
-                    # Update the message with new count
-                    if interaction.message:
-                        await interaction.message.edit(view=self)
+                    # Schedule debounced message update to prevent rate limiting
+                    if interaction.message and self.cog:
+                        await self.cog._schedule_message_update(interaction.message, self)
                 except Exception as edit_error:
                     logging.error(f"Error updating button count: {edit_error}")
             
@@ -216,9 +216,9 @@ class GiveawayJoinView(ui.View):
             # Update button label with current count
             button.label = str(total)
             
-            # Update the message with new button label
-            if interaction.message:
-                await interaction.message.edit(view=self)
+            # Schedule debounced message update to prevent rate limiting
+            if interaction.message and self.cog:
+                await self.cog._schedule_message_update(interaction.message, self)
             
             # Show paginated entries list (same as ended giveaway) - using followup since already deferred
             view = EntriesView(self.message_id, self.db)
@@ -724,6 +724,12 @@ class GiveawayCog(commands.Cog):
         self._cache_lock = asyncio.Lock()
         self._user_cooldowns: Dict[str, float] = {}  # user_id -> last_action_time
         self._cooldown_duration = 2.0  # seconds between actions per user
+        self._last_update_counts: Dict[str, int] = {}  # message_id -> last_count to prevent unnecessary edits
+        
+        # Rate limit protection for message edits
+        self._pending_updates: Dict[str, asyncio.Task] = {}  # message_id -> update task
+        self._last_edit_time: Dict[str, float] = {}  # message_id -> timestamp of last edit
+        self._edit_cooldown = 3.0  # Minimum seconds between message edits
 
     @discord.app_commands.command(name="giveaway-edit", description="Edit and manage giveaways")
     @discord.app_commands.default_permissions(administrator=True)
@@ -762,6 +768,64 @@ class GiveawayCog(commands.Cog):
         
         view = GiveawayEditView(self.bot)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    async def _schedule_message_update(self, message: discord.Message, view: ui.View):
+        """Schedule a debounced message update to prevent rate limiting."""
+        message_id = str(message.id)
+        
+        # Cancel any pending update for this message
+        if message_id in self._pending_updates:
+            task = self._pending_updates[message_id]
+            if not task.done():
+                task.cancel()
+        
+        # Schedule new update with delay
+        self._pending_updates[message_id] = asyncio.create_task(
+            self._debounced_message_update(message, view, message_id)
+        )
+    
+    async def _debounced_message_update(self, message: discord.Message, view: ui.View, message_id: str):
+        """Perform debounced message update with rate limit protection."""
+        try:
+            # Wait for debounce period (1 second to batch rapid updates)
+            await asyncio.sleep(1.0)
+            
+            # Check if enough time has passed since last edit
+            current_time = time.time()
+            if message_id in self._last_edit_time:
+                time_since_last = current_time - self._last_edit_time[message_id]
+                if time_since_last < self._edit_cooldown:
+                    # Wait for cooldown to expire
+                    await asyncio.sleep(self._edit_cooldown - time_since_last)
+            
+            # Perform the edit with retry on rate limit
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await message.edit(view=view)
+                    self._last_edit_time[message_id] = time.time()
+                    break
+                except discord.HTTPException as e:
+                    if e.status == 429:  # Rate limited
+                        retry_after = float(e.response.headers.get('Retry-After', 5))
+                        logging.warning(f"Rate limited on message {message_id}, waiting {retry_after}s")
+                        await asyncio.sleep(retry_after)
+                        if attempt == max_retries - 1:
+                            logging.error(f"Failed to update message {message_id} after {max_retries} retries")
+                    else:
+                        logging.error(f"HTTP error updating message {message_id}: {e}")
+                        break
+                except Exception as e:
+                    logging.error(f"Error updating message {message_id}: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass  # Task was cancelled, this is normal
+        except Exception as e:
+            logging.error(f"Unexpected error in debounced update for {message_id}: {e}")
+        finally:
+            # Clean up
+            if message_id in self._pending_updates:
+                del self._pending_updates[message_id]
 
     async def cog_load(self):
         await self.db.init()
@@ -807,6 +871,11 @@ class GiveawayCog(commands.Cog):
             if not task.done():
                 task.cancel()
         self.active_fake_reaction_tasks.clear()
+        # Cancel all pending message updates
+        for task in self._pending_updates.values():
+            if not task.done():
+                task.cancel()
+        self._pending_updates.clear()
         asyncio.create_task(self.db.close())
         self.logger.info("[INFO] GiveawayCog unloaded")
 
@@ -881,10 +950,11 @@ class GiveawayCog(commands.Cog):
             except Exception as e:
                 self.logger.error(f"Error in check_giveaways: {e}")
 
-    @tasks.loop(seconds=30)
+    @tasks.loop(seconds=60)
     async def update_button_counts(self):
-        """Update entry count buttons on active giveaways every 30 seconds.
-        Optimized for large servers with caching and batch processing."""
+        """Update entry count buttons on active giveaways every 60 seconds.
+        Optimized for large servers with caching and batch processing.
+        Only updates messages when count actually changes to avoid rate limits."""
         await self._ready.wait()
         if not self.db.connected:
             return
@@ -904,11 +974,19 @@ class GiveawayCog(commands.Cog):
             async with self._cache_lock:
                 self._participant_cache = counts_map.copy()
             
-            # Update messages (limit to 10 per cycle to avoid rate limits)
-            for gw in active[:10]:
+            # Update messages (limit to 5 per cycle to avoid rate limits)
+            updates_this_cycle = 0
+            for gw in active:
+                if updates_this_cycle >= 5:
+                    break
+                    
                 try:
                     mid = gw['message_id']
                     total = counts_map.get(mid, 0)
+                    
+                    # Skip update if count hasn't changed since last update
+                    if mid in self._last_update_counts and self._last_update_counts[mid] == total:
+                        continue
                     
                     channel = self.bot.get_channel(gw['channel_id'])
                     if not channel:
@@ -916,7 +994,13 @@ class GiveawayCog(commands.Cog):
                     
                     try:
                         message = await channel.fetch_message(int(mid))
-                    except (discord.NotFound, discord.HTTPException):
+                    except (discord.NotFound, discord.HTTPException) as e:
+                        # If message not found, mark giveaway as error
+                        if isinstance(e, discord.NotFound):
+                            await self.db.giveaways.update_one(
+                                {"message_id": mid},
+                                {"$set": {"status": "error", "error": "Message deleted"}}
+                            )
                         continue
                     
                     # Update view with new count
@@ -926,8 +1010,18 @@ class GiveawayCog(commands.Cog):
                             item.label = str(total)
                             break
                     
-                    await message.edit(view=view)
-                    await asyncio.sleep(0.5)  # Small delay to avoid rate limits
+                    try:
+                        await message.edit(view=view)
+                        # Track this count to avoid future unnecessary updates
+                        self._last_update_counts[mid] = total
+                        updates_this_cycle += 1
+                        await asyncio.sleep(1.5)  # Longer delay between edits to respect rate limits
+                    except discord.HTTPException as e:
+                        if e.status == 429:  # Rate limited
+                            self.logger.warning(f"Rate limited while updating giveaway {mid}, skipping this cycle")
+                            break  # Stop updating this cycle
+                        else:
+                            raise
                     
                 except Exception as msg_error:
                     self.logger.error(f"Error updating button count for {gw.get('message_id', 'unknown')}: {msg_error}")
@@ -1159,6 +1253,11 @@ class GiveawayCog(commands.Cog):
                 )
             except Exception as db_error:
                 self.logger.error(f"Error updating giveaway status: {db_error}")
+            
+            # Clean up cache entry for ended giveaway
+            async with self._cache_lock:
+                self._participant_cache.pop(message_id, None)
+                self._last_update_counts.pop(message_id, None)
             
             # Update statistics
             if self.config.enable_statistics:

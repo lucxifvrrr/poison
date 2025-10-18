@@ -700,7 +700,15 @@ class DiscordBot(commands.Bot):
             return
 
         # Files to skip (not cogs)
-        skip_files = {'config.py', '__init__.py'}
+        skip_files = {
+            'config.py', 
+            '__init__.py', 
+            'leaderboard_config.py',  # Config file, not a cog
+            'BUGFIXES.md',
+            'DEEP_ANALYSIS.md',
+            'CRITICAL_FIXES_APPLIED.md',
+            'README.md'
+        }
         
         # Walk through cogs directory and subdirectories
         for root, dirs, files in os.walk(COGS_DIR):

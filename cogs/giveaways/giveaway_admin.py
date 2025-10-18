@@ -656,6 +656,7 @@ class GiveawayAdminCog(commands.Cog):
             if hasattr(giveaway_cog, '_cache_lock') and hasattr(giveaway_cog, '_participant_cache'):
                 async with giveaway_cog._cache_lock:
                     giveaway_cog._participant_cache.pop(message_id, None)
+                    giveaway_cog._last_update_counts.pop(message_id, None)
             
             await interaction.followup.send(
                 f"✅ Giveaway cancelled successfully.\nReason: {reason}",
