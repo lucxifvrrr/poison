@@ -598,6 +598,26 @@ class GiveawayAdminCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         message_id: str,
+        reason: Optional[str] = "Cancelled by administrator"
+    ):
+        """Cancel an active giveaway."""
+        await interaction.response.defer(ephemeral=True)
+        try:
+            # Validate message ID format
+            try:
+                int(message_id)
+            except ValueError:
+                return await interaction.followup.send(
+                    "❌ Invalid message ID format. Please provide a valid numeric message ID.",
+                    ephemeral=True
+                )
+            
+            giveaway_cog = self.bot.get_cog("GiveawayCog")
+            if (
+                not giveaway_cog
+                or not hasattr(giveaway_cog, "db")
+                or not giveaway_cog.db.connected
+            ):
                 return await interaction.followup.send(
                     "Giveaway system not available.", ephemeral=True
                 )

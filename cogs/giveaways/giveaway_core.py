@@ -371,20 +371,20 @@ class GiveawayEndedView(ui.View):
         self.bot = bot
         
         # Set the correct label for entries button
-        self.entries_button.label = f"{participant_count}+ entries"
+        self.entries_button.label = f"{participant_count} entries"
     
     @ui.button(emoji=REACTION_EMOJI, style=ButtonStyle.gray, custom_id="giveaway_ended_join", row=0)
     async def join_button(self, interaction: discord.Interaction, button: ui.Button):
         """Show message that giveaway has ended."""
         try:
             await interaction.response.send_message(
-                "❌ This giveaway has ended. You can no longer join.",
+                "<:ogs_bell:1427918360401940552> This giveaway has ended. You can no longer join.",
                 ephemeral=True
             )
         except Exception as e:
             logging.error(f"Error in ended giveaway join button: {e}")
     
-    @ui.button(label="0+ entries", style=ButtonStyle.gray, custom_id="giveaway_ended_entries", row=0)
+    @ui.button(label="0 entries", style=ButtonStyle.gray, custom_id="giveaway_ended_entries", row=0)
     async def entries_button(self, interaction: discord.Interaction, button: ui.Button):
         """Show entries list for ended giveaway."""
         try:
@@ -597,18 +597,19 @@ class DatabaseManager:
             # Optimized for very large servers (10k+ members)
             self.client = AsyncIOMotorClient(
                 self.mongo_url,
-                serverSelectionTimeoutMS=5000,
-                connectTimeoutMS=10000,
-                socketTimeoutMS=45000,
+                serverSelectionTimeoutMS=30000,  # Increased from 5s to 30s
+                connectTimeoutMS=30000,  # Increased from 10s to 30s
+                socketTimeoutMS=120000,  # Increased from 45s to 120s
                 maxPoolSize=200,  # Increased for high concurrency
                 minPoolSize=20,   # Keep connections warm
-                maxIdleTimeMS=45000,
+                maxIdleTimeMS=300000,  # Increased from 45s to 5 minutes
                 retryWrites=True,
                 retryReads=True,
                 w=1,  # Write concern: acknowledge from primary only (faster)
                 readPreference='primaryPreferred',  # Read from primary when available
                 compressors='snappy,zlib',  # Compress network traffic
-                zlibCompressionLevel=6
+                zlibCompressionLevel=6,
+                heartbeatFrequencyMS=30000  # Check connection every 30s
             )
             self.db = self.client["giveaways"]
             self.giveaways = self.db["giveaways"]
@@ -750,12 +751,7 @@ class GiveawayCog(commands.Cog):
         if not self.db.connected:
             return
         try:
-            # Register views for active giveaways
-            active = await self.db.giveaways.find({"status": "active"}).to_list(length=None)
-            for gw in active:
-                mid = gw['message_id']
-                view = GiveawayJoinView(mid, self.db, self)
-                self.bot.add_view(view, message_id=int(mid))
+            # No views needed for active giveaways (reaction-only system)
             
             # Register views for ended giveaways
             ended = await self.db.giveaways.find({"status": "ended"}).to_list(length=None)
@@ -1012,15 +1008,8 @@ class GiveawayCog(commands.Cog):
             if interaction.guild and interaction.guild.icon:
                 embed.set_footer(text="made with ♡", icon_url=str(interaction.guild.icon))
 
-            # Create view for the giveaway
-            view = GiveawayJoinView(str(0), self.db, self)  # Temporary ID, will update
-            
-            # Send message with buttons
-            msg = await interaction.channel.send(embed=embed, view=view)
-            
-            # Update view with actual message ID and register it
-            view.message_id = str(msg.id)
-            self.bot.add_view(view, message_id=msg.id)
+            # Send message without buttons (reaction-only system)
+            msg = await interaction.channel.send(embed=embed)
             
             # Add reaction for users to join
             try:
@@ -1321,7 +1310,13 @@ class GiveawayCog(commands.Cog):
                     "rerolled_by": ctx.author.id
                 }}
             )
-            await ctx.send(f"{REACTION_EMOJI} Congratulations {', '.join(mentions)}! You won **{gw['prize']}**!")
+            
+            # Send winner announcement as reply to giveaway message
+            try:
+                await orig.reply(f"{REACTION_EMOJI} Congratulations {', '.join(mentions)}! You won **{gw['prize']}**!")
+            except Exception as reply_error:
+                # Fallback to channel send if reply fails
+                await ctx.send(f"{REACTION_EMOJI} Congratulations {', '.join(mentions)}! You won **{gw['prize']}**!")
         except Exception as e:
             self.logger.error(f"Error rerolling: {e}")
             await ctx.send(f"Error rerolling: {e}")
@@ -1469,15 +1464,8 @@ class GiveawayCog(commands.Cog):
             if ctx.guild and ctx.guild.icon:
                 embed.set_footer(text="made with ♡", icon_url=str(ctx.guild.icon))
 
-            # Create view for the giveaway
-            view = GiveawayJoinView(str(0), self.db, self)  # Temporary ID, will update
-            
-            # Send message with buttons
-            msg = await ctx.send(embed=embed, view=view)
-            
-            # Update view with actual message ID and register it
-            view.message_id = str(msg.id)
-            self.bot.add_view(view, message_id=msg.id)
+            # Send message without buttons (reaction-only system)
+            msg = await ctx.send(embed=embed)
             
             # Add reaction for users to join
             try:

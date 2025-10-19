@@ -85,7 +85,7 @@ class DiscordBot(commands.Bot):
         intents.presences = True
         intents.message_content = True
 
-        super().__init__(command_prefix=".", intents=intents)
+        super().__init__(command_prefix=",", intents=intents)
         self.session: Optional[aiohttp.ClientSession] = None
         self._ready_once = False
         self._synced_commands: List[discord.app_commands.Command] = []
@@ -101,14 +101,16 @@ class DiscordBot(commands.Bot):
             try:
                 self.mongo_client = AsyncIOMotorClient(
                     MONGO_URL,
-                    serverSelectionTimeoutMS=5000,
-                    connectTimeoutMS=10000,
-                    socketTimeoutMS=45000,
+                    serverSelectionTimeoutMS=30000,  # Increased from 5s to 30s
+                    connectTimeoutMS=30000,  # Increased from 10s to 30s
+                    socketTimeoutMS=120000,  # Increased from 45s to 120s
                     maxPoolSize=50,
                     minPoolSize=5,
-                    maxIdleTimeMS=45000,
+                    maxIdleTimeMS=300000,  # Increased from 45s to 5 minutes
                     retryWrites=True,
-                    retryReads=True
+                    retryReads=True,
+                    heartbeatFrequencyMS=30000,  # Check connection every 30s
+                    appName="DiscordBot"  # Identify connection in MongoDB Atlas
                 )
                 logging.info("Shared MongoDB connection initialized")
             except Exception as e:
