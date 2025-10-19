@@ -51,6 +51,57 @@ def get_utc_datetime():
     """Get current UTC datetime object."""
     return datetime.now(timezone.utc)
 
+def create_fake_participant_id(original_user_id: str, sequence: int) -> str:
+    """Create a fake participant ID with proper validation.
+    
+    Args:
+        original_user_id: The original Discord user ID
+        sequence: Sequence number for this fake entry
+        
+    Returns:
+        Formatted fake participant ID
+    """
+    if not original_user_id or not str(original_user_id).isdigit():
+        raise ValueError(f"Invalid user ID: {original_user_id}")
+    return f"fake_{original_user_id}_{sequence}"
+
+def parse_fake_participant_id(fake_id: str) -> Optional[str]:
+    """Extract original user ID from fake participant ID.
+    
+    Args:
+        fake_id: The fake participant ID
+        
+    Returns:
+        Original user ID if valid fake ID, None otherwise
+    """
+    if not fake_id or not isinstance(fake_id, str):
+        return None
+    
+    # New format: fake_<user_id>_<sequence>
+    if fake_id.startswith("fake_"):
+        parts = fake_id.split("_")
+        if len(parts) >= 3 and parts[1].isdigit():
+            return parts[1]
+    
+    # Legacy format: <user_id>_fake_<sequence>
+    if "_fake_" in fake_id:
+        parts = fake_id.split("_fake_")
+        if len(parts) == 2 and parts[0].isdigit():
+            return parts[0]
+    
+    return None
+
+def is_fake_participant(user_id: str) -> bool:
+    """Check if a user ID represents a fake participant.
+    
+    Args:
+        user_id: The user ID to check
+        
+    Returns:
+        True if fake participant, False otherwise
+    """
+    return user_id.startswith("fake_") or "_fake_" in user_id
+
 def get_thumbnail_url(guild):
     """Get thumbnail URL with fallback to server icon."""
     try:
@@ -88,125 +139,8 @@ def format_time_display(timestamp, display_timezone='UTC'):
     except Exception:
         return "Unknown time"
 
-class GiveawayJoinView(ui.View):
-    """Persistent view for active giveaways with join and entries buttons."""
-
-    def __init__(self, message_id: str, db_manager, cog=None):
-        super().__init__(timeout=None)
-        self.message_id = message_id
-        self.db = db_manager
-        self.cog = cog  # Reference to GiveawayCog for cache access
-
-    @ui.button(emoji=REACTION_EMOJI, style=ButtonStyle.gray, custom_id="join_giveaway", row=0)
-    async def join_button(self, interaction: discord.Interaction, button: ui.Button):
-        """Join the giveaway."""
-        try:
-            # Defer immediately to prevent timeout
-            await interaction.response.defer(ephemeral=True)
-            
-            # Check database connection
-            if not self.db or not self.db.connected:
-                return await interaction.followup.send(
-                    "❌ Database connection error. Please try again later.",
-                    ephemeral=True
-                )
-            
-            user_id = str(interaction.user.id)
-            
-            # Use update_one with upsert to prevent race conditions
-            # This is atomic and prevents duplicate entries even with rapid clicks
-            result = await self.db.participants.update_one(
-                {
-                    "message_id": self.message_id,
-                    "user_id": user_id
-                },
-                {
-                    "$setOnInsert": {
-                        "message_id": self.message_id,
-                        "user_id": user_id,
-                        "joined_at": get_current_utc_timestamp(),
-                        "is_forced": 0,
-                        "is_fake": 0,
-                        "original_user_id": None
-                    }
-                },
-                upsert=True
-            )
-            
-            # Check if this was a new entry (upserted_id exists) or already existed (matched_count > 0)
-            if result.matched_count > 0:
-                # User already joined
-                return await interaction.followup.send(
-                    "You have already joined this giveaway!",
-                    ephemeral=True
-                )
-            
-            # Send confirmation
-            await interaction.followup.send(
-                f"{REACTION_EMOJI} You have successfully joined the giveaway!",
-                ephemeral=True
-            )
-            
-        except Exception as e:
-            logging.error(f"Error joining giveaway: {e}")
-            try:
-                # Check for duplicate key error (MongoDB error code 11000)
-                if "duplicate key" in str(e).lower() or "11000" in str(e):
-                    await interaction.followup.send(
-                        "You have already joined this giveaway!",
-                        ephemeral=True
-                    )
-                else:
-                    await interaction.followup.send(
-                        "An error occurred while joining the giveaway.",
-                        ephemeral=True
-                    )
-            except Exception:
-                pass
-
-    @ui.button(label="0", style=ButtonStyle.gray, custom_id="view_entries", row=0)
-    async def entries_button(self, interaction: discord.Interaction, button: ui.Button):
-        """Show live entry count."""
-        try:
-            # Defer first to avoid double response
-            await interaction.response.defer(ephemeral=True)
-            
-            # Get count from cache first (faster), fallback to database
-            total = 0
-            if self.cog:
-                async with self.cog._cache_lock:
-                    total = self.cog._participant_cache.get(self.message_id, None)
-            
-            # If not in cache, query database
-            if total is None:
-                participants = await self.db.participants.find({"message_id": self.message_id}).to_list(length=None)
-                bot_id = str(interaction.client.user.id) if interaction.client and interaction.client.user else "0"
-                total = sum(1 for p in participants if p['user_id'] != bot_id)
-                
-                # Update cache
-                if self.cog:
-                    async with self.cog._cache_lock:
-                        self.cog._participant_cache[self.message_id] = total
-            
-            # Show paginated entries list (same as ended giveaway) - using followup since already deferred
-            view = EntriesView(self.message_id, self.db)
-            await view.show_entries_followup(interaction)
-            
-        except Exception as e:
-            logging.error(f"Error viewing entries: {e}")
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        "An error occurred while loading entries.",
-                        ephemeral=True
-                    )
-                else:
-                    await interaction.followup.send(
-                        "An error occurred while loading entries.",
-                        ephemeral=True
-                    )
-            except Exception:
-                pass
+# Note: Button-based system removed - now using reaction-only system
+# Users react with the giveaway emoji to join, handled by on_raw_reaction_add listener
 
 class EntriesView(ui.View):
     """Persistent view for displaying giveaway entries with pagination."""
@@ -296,7 +230,10 @@ class EntriesView(ui.View):
             text = ""
             for idx, part in enumerate(slice_participants, start=start + 1):
                 uid = part['id']
-                display = uid.split('_fake_')[0] if '_fake_' in uid else uid
+                # Use helper function to parse fake IDs
+                display = parse_fake_participant_id(uid) if is_fake_participant(uid) else uid
+                if not display:
+                    display = uid  # Fallback to original if parsing fails
                 try:
                     user = interaction.client.get_user(int(display))
                     if user:
@@ -591,6 +528,7 @@ class DatabaseManager:
         self.participants = None
         self.fake_reactions = None
         self.giveaway_stats = None
+        self.giveaway_history = None  # Historical tracking
 
     async def init(self):
         try:
@@ -616,6 +554,7 @@ class DatabaseManager:
             self.participants = self.db["participants"]
             self.fake_reactions = self.db["fake_reactions"]
             self.giveaway_stats = self.db["giveaway_stats"]
+            self.giveaway_history = self.db["giveaway_history"]
             self.connected = True
             await self._create_indexes()
             logging.info("Giveaway MongoDB connection initialized")
@@ -651,6 +590,14 @@ class DatabaseManager:
             
             # Stats collection indexes
             await self.giveaway_stats.create_index("guild_id", unique=True, background=True)
+            
+            # History collection indexes
+            await self.giveaway_history.create_index("guild_id", background=True)
+            await self.giveaway_history.create_index("timestamp", background=True)
+            await self.giveaway_history.create_index(
+                [("guild_id", ASCENDING), ("timestamp", ASCENDING)],
+                background=True
+            )
             
             logging.info("Giveaway indexes created successfully")
         except Exception as e:
@@ -748,12 +695,11 @@ class GiveawayCog(commands.Cog):
         self.logger.info("[OK] GiveawayCog loaded with reaction-based giveaway system")
 
     async def register_persistent_views(self):
+        """Register persistent views for ended giveaways on bot restart."""
         if not self.db.connected:
             return
         try:
-            # No views needed for active giveaways (reaction-only system)
-            
-            # Register views for ended giveaways
+            # Register views for ended giveaways only (active giveaways use reactions)
             ended = await self.db.giveaways.find({"status": "ended"}).to_list(length=None)
             for gw in ended:
                 mid = gw['message_id']
@@ -901,14 +847,46 @@ class GiveawayCog(commands.Cog):
         except Exception as e:
             self.logger.error(f"Error updating guild stats: {e}")
     
+    async def _record_giveaway_history(self, guild_id: int, event_type: str, 
+                                       giveaway_data: dict) -> None:
+        """Record giveaway event to history for trend analysis.
+        
+        Args:
+            guild_id: The guild ID
+            event_type: Type of event (started, ended, cancelled)
+            giveaway_data: Data about the giveaway
+        """
+        try:
+            history_entry = {
+                "guild_id": guild_id,
+                "timestamp": get_current_utc_timestamp(),
+                "event_type": event_type,
+                "message_id": giveaway_data.get("message_id"),
+                "prize": giveaway_data.get("prize"),
+                "participants": giveaway_data.get("participants", 0),
+                "winners_count": giveaway_data.get("winners_count", 0),
+                "actual_winners": giveaway_data.get("actual_winners", 0),
+                "duration_seconds": giveaway_data.get("duration_seconds", 0)
+            }
+            await self.db.giveaway_history.insert_one(history_entry)
+        except Exception as e:
+            self.logger.error(f"Error recording giveaway history: {e}")
+    
     async def _verify_winner(self, guild: discord.Guild, user_id: str) -> Tuple[bool, Optional[discord.Member]]:
         """Verify if a winner is still valid (in server, not banned)."""
         if not self.config.enable_winner_verification:
             return True, None
         
         try:
-            # Extract actual user ID (handle fake IDs)
-            actual_id = int(user_id.split('_fake_')[0]) if '_fake_' in user_id else int(user_id)
+            # Extract actual user ID (handle fake IDs using helper function)
+            if is_fake_participant(user_id):
+                actual_id_str = parse_fake_participant_id(user_id)
+                if not actual_id_str:
+                    return False, None
+                actual_id = int(actual_id_str)
+            else:
+                actual_id = int(user_id)
+            
             member = guild.get_member(actual_id)
             
             if not member:
@@ -1039,6 +1017,17 @@ class GiveawayCog(commands.Cog):
                 # Update statistics
                 if self.config.enable_statistics:
                     await self._update_guild_stats(interaction.guild.id, giveaways_delta=1)
+                    # Record to history
+                    await self._record_giveaway_history(
+                        interaction.guild.id,
+                        "started",
+                        {
+                            "message_id": str(msg.id),
+                            "prize": prize,
+                            "winners_count": winners,
+                            "duration_seconds": secs
+                        }
+                    )
                 
                 await interaction.followup.send("Giveaway started!", ephemeral=True)
             else:
@@ -1129,7 +1118,17 @@ class GiveawayCog(commands.Cog):
                         if is_valid:
                             verified_winners.append(winner_id)
 
-            mentions = [f"<@{w.split('_fake_')[0]}>" for w in verified_winners] or ["No winners."]
+            # Generate winner mentions using helper function
+            mentions = []
+            for w in verified_winners:
+                if is_fake_participant(w):
+                    original_id = parse_fake_participant_id(w)
+                    if original_id:
+                        mentions.append(f"<@{original_id}>")
+                else:
+                    mentions.append(f"<@{w}>")
+            if not mentions:
+                mentions = ["No winners."]
             now_ts = get_current_utc_timestamp()
             icon = None
             if chan.guild and chan.guild.icon:
@@ -1206,6 +1205,20 @@ class GiveawayCog(commands.Cog):
                         chan.guild.id,
                         participants_delta=total_participants,
                         winners_delta=len(verified_winners)
+                    )
+                    # Record to history
+                    duration = now_ts - gw.get("created_at", now_ts)
+                    await self._record_giveaway_history(
+                        chan.guild.id,
+                        "ended",
+                        {
+                            "message_id": message_id,
+                            "prize": gw.get("prize", "Unknown"),
+                            "participants": total_participants,
+                            "winners_count": gw["winners_count"],
+                            "actual_winners": len(verified_winners),
+                            "duration_seconds": duration
+                        }
                     )
                 except Exception as stats_error:
                     self.logger.error(f"Error updating stats: {stats_error}")
@@ -1346,6 +1359,18 @@ class GiveawayCog(commands.Cog):
                 "status": "active"
             }).to_list(length=None)
             
+            # Get historical data (last 30 days)
+            thirty_days_ago = get_current_utc_timestamp() - (30 * 86400)
+            history = await self.db.giveaway_history.find({
+                "guild_id": interaction.guild.id,
+                "timestamp": {"$gte": thirty_days_ago}
+            }).to_list(length=None)
+            
+            # Calculate trends
+            ended_count = len([h for h in history if h["event_type"] == "ended"])
+            cancelled_count = len([h for h in history if h["event_type"] == "cancelled"])
+            avg_participants = sum(h.get("participants", 0) for h in history if h["event_type"] == "ended") / max(ended_count, 1)
+            
             embed = discord.Embed(
                 title="📊 Giveaway Statistics",
                 color=EMBED_COLOR,
@@ -1353,35 +1378,43 @@ class GiveawayCog(commands.Cog):
             )
             
             embed.add_field(
-                name="Total Giveaways",
-                value=f"**{stats.get('total_giveaways', 0)}**",
-                inline=True
+                name="📈 All-Time Stats",
+                value=(
+                    f"**Total Giveaways:** {stats.get('total_giveaways', 0)}\n"
+                    f"**Total Participants:** {stats.get('total_participants', 0)}\n"
+                    f"**Total Winners:** {stats.get('total_winners', 0)}"
+                ),
+                inline=False
             )
+            
             embed.add_field(
-                name="Active Giveaways",
-                value=f"**{len(active)}**",
-                inline=True
-            )
-            embed.add_field(
-                name="Total Winners",
-                value=f"**{stats.get('total_winners', 0)}**",
-                inline=True
-            )
-            embed.add_field(
-                name="Total Participants",
-                value=f"**{stats.get('total_participants', 0)}**",
+                name="🔥 Current Activity",
+                value=f"**Active Giveaways:** {len(active)}",
                 inline=True
             )
             
             if stats.get('last_giveaway'):
                 embed.add_field(
-                    name="Last Giveaway",
+                    name="⏰ Last Giveaway",
                     value=f"<t:{stats['last_giveaway']}:R>",
                     inline=True
                 )
             
+            if history:
+                embed.add_field(
+                    name="📅 Last 30 Days",
+                    value=(
+                        f"**Completed:** {ended_count}\n"
+                        f"**Cancelled:** {cancelled_count}\n"
+                        f"**Avg Participants:** {int(avg_participants)}"
+                    ),
+                    inline=False
+                )
+            
             if interaction.guild.icon:
                 embed.set_thumbnail(url=interaction.guild.icon.url)
+            
+            embed.set_footer(text="Historical data available for the last 30 days")
             
             await interaction.followup.send(embed=embed, ephemeral=True)
             

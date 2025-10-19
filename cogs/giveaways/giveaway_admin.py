@@ -8,7 +8,10 @@ from typing import List, Dict, Optional
 from discord.ext import commands, tasks
 
 # Import from core and config
-from cogs.giveaways.giveaway_core import get_current_utc_timestamp
+from cogs.giveaways.giveaway_core import (
+    get_current_utc_timestamp, create_fake_participant_id, 
+    parse_fake_participant_id, is_fake_participant
+)
 from cogs.giveaways.config import (
     DOT_EMOJI, RED_DOT_EMOJI, EMBED_COLOR, MIN_FAKE_REACTIONS, MAX_FAKE_REACTIONS, 
     MIN_FAKE_DURATION, MAX_FAKE_DURATION, PRIZE_EMOJI, WINNER_EMOJI, TIME_EMOJI, GIFT_EMOJI
@@ -22,6 +25,9 @@ class GiveawayAdminCog(commands.Cog):
         self.logger = logging.getLogger('GiveawayBot')
         self.active_fake_reaction_tasks: Dict[str, asyncio.Task] = {}
         self._ready = asyncio.Event()
+        # Rate limiting: track last fill time per guild to prevent spam
+        self._guild_fill_cooldowns: Dict[int, float] = {}
+        self._fill_cooldown_seconds = 60  # 1 minute cooldown between fills per guild
 
     async def cog_load(self) -> None:
         """Called when cog is loaded."""
@@ -110,6 +116,18 @@ class GiveawayAdminCog(commands.Cog):
     ):
         await interaction.response.defer(ephemeral=True)
         try:
+            # Rate limiting check
+            guild_id = interaction.guild.id if interaction.guild else 0
+            current_time = get_current_utc_timestamp()
+            last_fill_time = self._guild_fill_cooldowns.get(guild_id, 0)
+            
+            if current_time - last_fill_time < self._fill_cooldown_seconds:
+                remaining = int(self._fill_cooldown_seconds - (current_time - last_fill_time))
+                return await interaction.followup.send(
+                    f"⏳ Please wait {remaining} seconds before starting another fake fill in this server.",
+                    ephemeral=True
+                )
+            
             # Validate message ID format
             try:
                 int(message_id)
@@ -187,9 +205,12 @@ class GiveawayAdminCog(commands.Cog):
                 )
             )
             self.active_fake_reaction_tasks[message_id] = task
+            
+            # Update cooldown after successful start
+            self._guild_fill_cooldowns[guild_id] = current_time
 
             await interaction.followup.send(
-                f"Started fake fill: {total_fake_reactions} over {duration_in_minutes} minutes.",
+                f"✅ Started fake fill: {total_fake_reactions} reactions over {duration_in_minutes} minutes.",
                 ephemeral=True,
             )
 
@@ -255,7 +276,8 @@ class GiveawayAdminCog(commands.Cog):
                     available = member_ids
 
                 user_id = random.choice(available)
-                fake_id = f"{user_id}_fake_{total_reactions - remaining}"
+                sequence = total_reactions - remaining
+                fake_id = create_fake_participant_id(user_id, sequence)
 
                 # Check if this fake user already exists in the participants table
                 existing = await giveaway_cog.db.participants.find_one({
@@ -692,6 +714,27 @@ class GiveawayAdminCog(commands.Cog):
             if hasattr(giveaway_cog, '_cache_lock') and hasattr(giveaway_cog, '_participant_cache'):
                 async with giveaway_cog._cache_lock:
                     giveaway_cog._participant_cache.pop(message_id, None)
+            
+            # Record to history
+            if giveaway_cog.config.enable_statistics:
+                try:
+                    parts = await giveaway_cog.db.participants.find({"message_id": message_id}).to_list(length=None)
+                    total_parts = len([p for p in parts if p['user_id'] != str(interaction.client.user.id)])
+                    duration = now_ts - gw.get("created_at", now_ts)
+                    await giveaway_cog._record_giveaway_history(
+                        channel.guild.id,
+                        "cancelled",
+                        {
+                            "message_id": message_id,
+                            "prize": gw.get("prize", "Unknown"),
+                            "participants": total_parts,
+                            "winners_count": gw["winners_count"],
+                            "actual_winners": 0,
+                            "duration_seconds": duration
+                        }
+                    )
+                except Exception as hist_error:
+                    self.logger.error(f"Error recording cancellation history: {hist_error}")
             
             await interaction.followup.send(
                 f"✅ Giveaway cancelled successfully.\nReason: {reason}",
