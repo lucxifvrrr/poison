@@ -7,12 +7,23 @@ Features:
 - Weekly selection every Sunday 11 AM (guild timezone) - runs BEFORE weekly reset
 - Combined scoring: chat messages + voice minutes
 - Configurable weights per guild
-- Auto role assignment/removal
+- Auto role assignment/removal (removes from previous winner first)
+- Automatic weekly leaderboard reset after selection
 - DM winner with styled embed
 - Optional public announcement
 - History tracking in MongoDB
 - Tie-breaker: voice minutes > chat messages
 - Bot users are automatically excluded
+
+Selection Process:
+1. Calculate scores for all active members
+2. Select winner with highest score
+3. Remove Star role from previous winner (if any)
+4. Assign Star role to new winner
+5. Save winner to history
+6. Notify winner via DM and optional announcement
+7. Reset weekly stats for both chat and voice leaderboards
+8. Archive old stats to database
 
 Admin Commands (consolidated under /star):
 - /star setup role:@role announce_channel:#channel weight_chat:1.0 weight_voice:2.0
@@ -32,6 +43,7 @@ import os
 from typing import Optional, Dict, List
 import pytz
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()
 
@@ -46,14 +58,15 @@ class StarOfTheWeekCog(commands.Cog):
         self.bot = bot
         self.mongo_client = None
         self.db = None
+        self.logger = logging.getLogger('discord.bot.star_of_the_week')
     
     async def cog_load(self):
         """Initialize MongoDB connection on cog load"""
         # Reuse bot's shared MongoDB connection
         if hasattr(self.bot, 'mongo_client') and self.bot.mongo_client:
             self.mongo_client = self.bot.mongo_client
-            self.db = self.mongo_client['discord_bot']
-            print("✅ Star of the Week Cog: Reusing shared MongoDB connection")
+            self.db = self.mongo_client['poison_bot']
+            self.logger.info("Star of the Week Cog: Reusing shared MongoDB connection")
         else:
             # Fallback: create new connection if shared one doesn't exist
             mongo_url = os.getenv('MONGO_URL')
@@ -61,8 +74,11 @@ class StarOfTheWeekCog(commands.Cog):
                 raise ValueError("MONGO_URL not found in environment variables")
             
             self.mongo_client = AsyncIOMotorClient(mongo_url)
-            self.db = self.mongo_client['discord_bot']
-            print("✅ Star of the Week Cog: MongoDB connected")
+            self.db = self.mongo_client['poison_bot']
+            self.logger.info("Star of the Week Cog: MongoDB connected")
+        
+        # Create indexes for optimal performance
+        await self._create_indexes()
         
         # Start task AFTER database connection is established
         self.weekly_star_selection.start()
@@ -75,7 +91,38 @@ class StarOfTheWeekCog(commands.Cog):
         if self.mongo_client and not hasattr(self.bot, 'mongo_client'):
             self.mongo_client.close()
     
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild):
+        """Clean up data when bot is removed from a guild"""
+        try:
+            self.logger.info(f"Bot removed from guild {guild.name} ({guild.id}), cleaning up data")
+            
+            # Delete star config
+            await self.db.star_configs.delete_one({'guild_id': guild.id})
+            
+            # Delete star history
+            result = await self.db.star_history.delete_many({'guild_id': guild.id})
+            self.logger.info(f"Deleted {result.deleted_count} star history records for guild {guild.id}")
+            
+            self.logger.info(f"Star system cleanup complete for guild {guild.id}")
+        except Exception as e:
+            self.logger.error(f"Error cleaning up star data for guild {guild.id}: {e}", exc_info=True)
+    
     # ==================== DATABASE HELPERS ====================
+    
+    async def _create_indexes(self):
+        """Create database indexes for star of the week collections"""
+        try:
+            # Star configs indexes
+            await self.db.star_configs.create_index('guild_id', unique=True)
+            
+            # Star history indexes
+            await self.db.star_history.create_index([('guild_id', 1), ('awarded_at', -1)])
+            await self.db.star_history.create_index([('user_id', 1)])
+            
+            self.logger.info("Star of the Week: Database indexes created/verified")
+        except Exception as e:
+            self.logger.warning(f"Error creating indexes (may already exist): {e}")
     
     async def _get_guild_config(self, guild_id: int) -> Optional[Dict]:
         """Fetch guild configuration from MongoDB"""
@@ -142,7 +189,18 @@ class StarOfTheWeekCog(commands.Cog):
         if guild:
             filtered_stats = []
             for stat in stats:
+                # Try cache first, fall back to API if not found
                 member = guild.get_member(stat['user_id'])
+                if not member:
+                    try:
+                        member = await guild.fetch_member(stat['user_id'])
+                    except discord.NotFound:
+                        # User left the server
+                        continue
+                    except discord.HTTPException as e:
+                        self.logger.warning(f"Failed to fetch member {stat['user_id']}: {e}")
+                        continue
+                
                 if member and not member.bot:
                     filtered_stats.append(stat)
             return filtered_stats
@@ -178,7 +236,7 @@ class StarOfTheWeekCog(commands.Cog):
         # Get configuration
         star_config = await self._get_star_config(guild_id)
         if not star_config:
-            print(f"⚠️ No Star config for guild {guild_id}")
+            self.logger.warning(f"No Star config for guild {guild_id}")
             return None
         
         weight_chat = star_config.get('weight_chat', 1.0)
@@ -188,7 +246,7 @@ class StarOfTheWeekCog(commands.Cog):
         stats = await self._get_weekly_stats(guild_id)
         
         if not stats:
-            print(f"⚠️ No weekly activity for guild {guild_id}")
+            self.logger.info(f"No weekly activity for guild {guild_id}")
             return None
         
         # Calculate scores for all users
@@ -223,40 +281,256 @@ class StarOfTheWeekCog(commands.Cog):
     
     # ==================== ROLE MANAGEMENT ====================
     
+    async def _reset_weekly_leaderboards(self, guild_id: int):
+        """
+        Reset weekly stats for both chat and voice leaderboards after Star selection.
+        This archives the current week's data and resets counters to 0.
+        
+        Args:
+            guild_id: Discord guild ID
+        """
+        try:
+            self.logger.info(f"Resetting weekly leaderboards for guild {guild_id} after Star selection")
+            
+            # Archive and reset chat weekly stats
+            cursor = self.db.user_stats.find({'guild_id': guild_id, 'chat_weekly': {'$gt': 0}})
+            chat_stats = await cursor.to_list(length=10000)
+            if chat_stats:
+                archive_doc = {
+                    'guild_id': guild_id,
+                    'type': 'chat',
+                    'period': 'weekly',
+                    'reset_date': datetime.utcnow(),
+                    'reset_reason': 'star_of_the_week_selection',
+                    'stats': chat_stats
+                }
+                await self.db.weekly_history.insert_one(archive_doc)
+                self.logger.info(f"Archived {len(chat_stats)} chat weekly stats for guild {guild_id}")
+            
+            # Archive and reset voice weekly stats
+            cursor = self.db.user_stats.find({'guild_id': guild_id, 'voice_weekly': {'$gt': 0}})
+            voice_stats = await cursor.to_list(length=10000)
+            if voice_stats:
+                archive_doc = {
+                    'guild_id': guild_id,
+                    'type': 'voice',
+                    'period': 'weekly',
+                    'reset_date': datetime.utcnow(),
+                    'reset_reason': 'star_of_the_week_selection',
+                    'stats': voice_stats
+                }
+                await self.db.weekly_history.insert_one(archive_doc)
+                self.logger.info(f"Archived {len(voice_stats)} voice weekly stats for guild {guild_id}")
+            
+            # Reset both chat_weekly and voice_weekly to 0
+            result = await self.db.user_stats.update_many(
+                {'guild_id': guild_id},
+                {'$set': {'chat_weekly': 0, 'voice_weekly': 0}}
+            )
+            
+            # Persist reset timestamps to database for coordination with other cogs
+            await self.db.guild_configs.update_one(
+                {'guild_id': guild_id},
+                {
+                    '$set': {
+                        'last_chat_weekly_reset': datetime.utcnow(),
+                        'last_voice_weekly_reset': datetime.utcnow(),
+                        'last_star_selection': datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
+            
+            self.logger.info(f"Reset weekly stats for {result.modified_count} users in guild {guild_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error resetting weekly leaderboards for guild {guild_id}: {e}", exc_info=True)
+    
     async def _assign_star_role(self, guild: discord.Guild, user_id: int, role_id: int) -> bool:
         """
         Assign Star of the Week role to user and remove from previous winner.
+        Includes retry logic for rate limits.
         
         Returns:
             True if successful, False otherwise
         """
         try:
+            self.logger.info(f"[STAR ROLE] Starting role assignment for user {user_id} in guild {guild.name}")
+            
             role = guild.get_role(role_id)
             if not role:
-                print(f"❌ Star role {role_id} not found in guild {guild.id}")
+                self.logger.error(f"[STAR ROLE] ❌ Star role {role_id} not found in guild {guild.id}")
                 return False
             
-            # Remove role from previous winner
+            self.logger.info(f"[STAR ROLE] Found role: {role.name} (ID: {role.id}, Position: {role.position})")
+            
+            # Check bot's highest role position
+            bot_member = guild.get_member(self.bot.user.id)
+            if bot_member:
+                bot_top_role = bot_member.top_role
+                self.logger.info(f"[STAR ROLE] Bot's top role: {bot_top_role.name} (Position: {bot_top_role.position})")
+                
+                if bot_top_role.position <= role.position:
+                    self.logger.error(
+                        f"[STAR ROLE] ❌ ROLE HIERARCHY ERROR: Bot's role ({bot_top_role.name}, pos {bot_top_role.position}) "
+                        f"is not above Star role ({role.name}, pos {role.position}). "
+                        f"Move the bot's role ABOVE the Star role in Server Settings > Roles."
+                    )
+                    return False
+                
+                # Check permissions
+                if not bot_member.guild_permissions.manage_roles:
+                    self.logger.error(f"[STAR ROLE] ❌ Bot lacks 'Manage Roles' permission in guild {guild.id}")
+                    return False
+            else:
+                self.logger.warning(f"[STAR ROLE] Could not find bot member in guild {guild.id}")
+            
+            # Remove role from previous winner (with retry)
             previous_winner = await self._get_previous_winner(guild.id)
             if previous_winner:
                 prev_member = guild.get_member(previous_winner['user_id'])
-                if prev_member and role in prev_member.roles:
-                    await prev_member.remove_roles(role, reason="Star of the Week expired")
-                    print(f"✅ Removed Star role from {prev_member.display_name}")
+                if not prev_member:
+                    # Try fetching from API if not in cache
+                    try:
+                        prev_member = await guild.fetch_member(previous_winner['user_id'])
+                    except discord.NotFound:
+                        self.logger.info(f"Previous winner {previous_winner['user_id']} no longer in guild {guild.id}")
+                    except discord.HTTPException as e:
+                        self.logger.warning(f"Failed to fetch previous winner {previous_winner['user_id']}: {e}")
+                
+                if prev_member:
+                    success = await self._remove_role_with_retry(prev_member, role, "Star of the Week expired")
+                    if success:
+                        self.logger.info(f"Removed Star role from {prev_member.display_name} in guild {guild.id}")
+                    else:
+                        self.logger.warning(f"Failed to remove Star role from previous winner {prev_member.display_name}")
             
-            # Add role to new winner
+            # Add role to new winner (try cache first, then fetch)
+            self.logger.info(f"[STAR ROLE] Fetching winner member {user_id}...")
             member = guild.get_member(user_id)
             if not member:
-                print(f"❌ Winner {user_id} not found in guild {guild.id}")
-                return False
+                self.logger.info(f"[STAR ROLE] Winner not in cache, fetching from API...")
+                try:
+                    member = await guild.fetch_member(user_id)
+                    self.logger.info(f"[STAR ROLE] Successfully fetched winner from API: {member.display_name}")
+                except discord.NotFound:
+                    self.logger.error(f"[STAR ROLE] ❌ Winner {user_id} not found in guild {guild.id}")
+                    return False
+                except Exception as e:
+                    self.logger.error(f"[STAR ROLE] ❌ Error fetching winner {user_id}: {e}")
+                    return False
+            else:
+                self.logger.info(f"[STAR ROLE] Found winner in cache: {member.display_name}")
             
-            await member.add_roles(role, reason="Star of the Week winner")
-            print(f"✅ Assigned Star role to {member.display_name}")
-            return True
+            # Add role with retry logic
+            success = await self._add_role_with_retry(member, role, "Star of the Week winner")
+            if success:
+                self.logger.info(f"Assigned Star role to {member.display_name} in guild {guild.id}")
+            return success
         
         except Exception as e:
-            print(f"❌ Error assigning Star role: {e}")
+            self.logger.error(f"Error assigning Star role in guild {guild.id}: {e}", exc_info=True)
             return False
+    
+    async def _add_role_with_retry(self, member: discord.Member, role: discord.Role, reason: str, max_retries: int = 3) -> bool:
+        """Add role with retry logic for rate limits"""
+        for attempt in range(max_retries):
+            try:
+                # Skip if member already has the role
+                if role in member.roles:
+                    self.logger.info(f"Member {member.display_name} already has role {role.name}")
+                    return True
+                
+                await member.add_roles(role, reason=reason)
+                
+                # Verify the role was actually added by refetching the member
+                await asyncio.sleep(0.5)  # Small delay to ensure Discord's cache updates
+                updated_member = member.guild.get_member(member.id)
+                if not updated_member:
+                    # Fallback to API fetch
+                    try:
+                        updated_member = await member.guild.fetch_member(member.id)
+                    except discord.HTTPException:
+                        self.logger.warning(f"Could not verify role assignment for {member.display_name}")
+                        return True  # Assume success if we can't verify
+                
+                if role in updated_member.roles:
+                    self.logger.info(f"Successfully verified role {role.name} added to {member.display_name}")
+                    return True
+                else:
+                    self.logger.warning(f"Role {role.name} not found on {member.display_name} after add_roles call (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    return False
+                    
+            except discord.HTTPException as e:
+                if e.status == 429:  # Rate limited
+                    retry_after = float(e.response.headers.get('Retry-After', 1))
+                    self.logger.warning(f"Rate limited adding role, retrying after {retry_after}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(retry_after)
+                elif e.status == 403:  # Forbidden
+                    self.logger.error(f"Missing permissions to add role: {e}")
+                    return False
+                else:
+                    self.logger.error(f"HTTP error adding role: {e}")
+                    if attempt == max_retries - 1:
+                        return False
+                    await asyncio.sleep(1)
+            except Exception as e:
+                self.logger.error(f"Unexpected error adding role: {e}")
+                return False
+        return False
+    
+    async def _remove_role_with_retry(self, member: discord.Member, role: discord.Role, reason: str, max_retries: int = 3) -> bool:
+        """Remove role with retry logic for rate limits"""
+        for attempt in range(max_retries):
+            try:
+                # Skip if member doesn't have the role
+                if role not in member.roles:
+                    self.logger.info(f"Member {member.display_name} doesn't have role {role.name}, skipping removal")
+                    return True
+                
+                await member.remove_roles(role, reason=reason)
+                
+                # Verify the role was actually removed by refetching the member
+                await asyncio.sleep(0.5)  # Small delay to ensure Discord's cache updates
+                updated_member = member.guild.get_member(member.id)
+                if not updated_member:
+                    # Fallback to API fetch
+                    try:
+                        updated_member = await member.guild.fetch_member(member.id)
+                    except discord.HTTPException:
+                        self.logger.warning(f"Could not verify role removal for {member.display_name}")
+                        return True  # Assume success if we can't verify
+                
+                if role not in updated_member.roles:
+                    self.logger.info(f"Successfully verified role {role.name} removed from {member.display_name}")
+                    return True
+                else:
+                    self.logger.warning(f"Role {role.name} still on {member.display_name} after remove_roles call (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    return False
+                    
+            except discord.HTTPException as e:
+                if e.status == 429:  # Rate limited
+                    retry_after = float(e.response.headers.get('Retry-After', 1))
+                    self.logger.warning(f"Rate limited removing role, retrying after {retry_after}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(retry_after)
+                elif e.status == 403:  # Forbidden
+                    self.logger.error(f"Missing permissions to remove role: {e}")
+                    return False
+                else:
+                    self.logger.error(f"HTTP error removing role: {e}")
+                    if attempt == max_retries - 1:
+                        return False
+                    await asyncio.sleep(1)
+            except Exception as e:
+                self.logger.error(f"Unexpected error removing role: {e}")
+                return False
+        return False
     
     # ==================== NOTIFICATIONS ====================
     
@@ -351,18 +625,18 @@ class StarOfTheWeekCog(commands.Cog):
         """
         member = guild.get_member(user_id)
         if not member:
-            print(f"❌ Winner {user_id} not found in guild {guild.id}")
+            self.logger.error(f"Winner {user_id} not found in guild {guild.id}")
             return
         
         # Send DM to winner
         try:
             dm_embed = self._create_winner_dm_embed(guild, score, chat_count, voice_minutes)
             await member.send(embed=dm_embed)
-            print(f"✅ Sent Star DM to {member.display_name}")
+            self.logger.info(f"Sent Star DM to {member.display_name} in guild {guild.id}")
         except discord.Forbidden:
-            print(f"⚠️ Cannot DM {member.display_name} (DMs disabled)")
+            self.logger.warning(f"Cannot DM {member.display_name} (DMs disabled) in guild {guild.id}")
         except Exception as e:
-            print(f"❌ Error sending DM to winner: {e}")
+            self.logger.error(f"Error sending DM to winner in guild {guild.id}: {e}", exc_info=True)
         
         # Announce in channel if configured
         star_config = await self._get_star_config(guild.id)
@@ -372,17 +646,25 @@ class StarOfTheWeekCog(commands.Cog):
                 if channel:
                     announce_embed = self._create_announcement_embed(member, score, chat_count, voice_minutes)
                     await channel.send(embed=announce_embed)
-                    print(f"✅ Announced Star in {channel.name}")
+                    self.logger.info(f"Announced Star in {channel.name} (guild {guild.id})")
+                else:
+                    # Channel was deleted - clear it from config
+                    self.logger.warning(f"Announcement channel {star_config['announce_channel_id']} not found for guild {guild.id}, clearing from config")
+                    await self.db.star_configs.update_one(
+                        {'guild_id': guild.id},
+                        {'$set': {'announce_channel_id': None}}
+                    )
             except Exception as e:
-                print(f"❌ Error announcing Star: {e}")
+                self.logger.error(f"Error announcing Star in guild {guild.id}: {e}", exc_info=True)
     
     # ==================== BACKGROUND TASKS ====================
     
     @tasks.loop(hours=1)
     async def weekly_star_selection(self):
         """
-        Check for weekly Star selection (Sunday 12 PM guild time).
+        Check for weekly Star selection (Sunday 11 AM guild time).
         Runs every hour and checks if it's time to select.
+        Runs 1 hour BEFORE weekly reset to ensure stats are available.
         """
         try:
             # Get all guilds with Star config
@@ -394,6 +676,7 @@ class StarOfTheWeekCog(commands.Cog):
                 guild = self.bot.get_guild(guild_id)
                 
                 if not guild:
+                    self.logger.warning(f"Guild {guild_id} not found, skipping Star selection")
                     continue
                 
                 # Get guild timezone
@@ -412,17 +695,29 @@ class StarOfTheWeekCog(commands.Cog):
                             # Check if selection was within last 6 days (avoid duplicate selections)
                             time_since_last = datetime.utcnow() - previous_winner['awarded_at']
                             if time_since_last < timedelta(days=6):
-                                print(f"⏭️ Already selected Star this week for guild {guild_id}")
+                                self.logger.debug(f"Already selected Star this week for guild {guild_id}")
                                 continue
                         
                         # Select Star of the Week
+                        self.logger.info(f"Triggering Star of the Week selection for guild {guild_id}")
                         await self._process_star_selection(guild)
+                    
+                    # Check for missed selection (if last selection was more than 8 days ago)
+                    else:
+                        previous_winner = await self._get_previous_winner(guild_id)
+                        if previous_winner:
+                            time_since_last = datetime.utcnow() - previous_winner['awarded_at']
+                            if time_since_last > timedelta(days=8):
+                                self.logger.warning(f"Missed Star selection detected for guild {guild_id}, executing now")
+                                await self._process_star_selection(guild)
                 
+                except pytz.exceptions.UnknownTimeZoneError:
+                    self.logger.error(f"Invalid timezone for guild {guild_id}: {tz_name}")
                 except Exception as e:
-                    print(f"❌ Error checking Star selection for guild {guild_id}: {e}")
+                    self.logger.error(f"Error checking Star selection for guild {guild_id}: {e}", exc_info=True)
         
         except Exception as e:
-            print(f"❌ Error in weekly_star_selection task: {e}")
+            self.logger.error(f"Error in weekly_star_selection task: {e}", exc_info=True)
     
     @weekly_star_selection.before_loop
     async def before_weekly_star_selection(self):
@@ -433,26 +728,30 @@ class StarOfTheWeekCog(commands.Cog):
         """
         Process Star of the Week selection for a guild.
         
+        This process is transactional - if any critical step fails, the entire
+        selection is aborted to prevent data loss.
+        
         Args:
             guild: Discord guild
         """
         try:
-            print(f"🌟 Processing Star of the Week selection for {guild.name}")
+            self.logger.info(f"Processing Star of the Week selection for {guild.name} (ID: {guild.id})")
             
             # Select winner
             winner = await self._select_star_of_week(guild.id)
             
             if not winner:
-                print(f"⚠️ No eligible users for Star of the Week in {guild.name}")
+                self.logger.warning(f"No eligible users for Star of the Week in {guild.name}")
                 return
             
             # Get Star config
             star_config = await self._get_star_config(guild.id)
             if not star_config:
-                print(f"❌ No Star config found for guild {guild.id}")
+                self.logger.error(f"No Star config found for guild {guild.id}")
                 return
             
-            # Assign role
+            # Step 1: Assign role (CRITICAL - must succeed)
+            # This removes role from previous winner and assigns to new winner
             role_assigned = await self._assign_star_role(
                 guild, 
                 winner['user_id'], 
@@ -460,31 +759,64 @@ class StarOfTheWeekCog(commands.Cog):
             )
             
             if not role_assigned:
-                print(f"❌ Failed to assign Star role in {guild.name}")
-                return
+                self.logger.error(
+                    f"❌ CRITICAL: Failed to assign Star role in {guild.name}. "
+                    f"Aborting star selection to preserve leaderboard data. "
+                    f"Please check role permissions and configuration, then try manual selection."
+                )
+                return  # STOP HERE - don't reset leaderboards if role wasn't assigned
             
-            # Save to history
-            await self._save_star_winner(
-                guild.id,
-                winner['user_id'],
-                winner['score'],
-                winner['chat_weekly'],
-                winner['voice_weekly']
+            # Step 2: Save to history (CRITICAL - must succeed)
+            try:
+                await self._save_star_winner(
+                    guild.id,
+                    winner['user_id'],
+                    winner['score'],
+                    winner['chat_weekly'],
+                    winner['voice_weekly']
+                )
+            except Exception as e:
+                self.logger.error(
+                    f"❌ CRITICAL: Failed to save star winner to history in {guild.name}: {e}. "
+                    f"Attempting rollback of role assignment."
+                )
+                # Rollback: Remove role from winner since we couldn't save to history
+                try:
+                    member = guild.get_member(winner['user_id'])
+                    role = guild.get_role(star_config['role_id'])
+                    if member and role and role in member.roles:
+                        await member.remove_roles(role, reason="Star selection failed - rollback")
+                        self.logger.info(f"Rolled back role assignment for {member.display_name}")
+                except Exception as rollback_error:
+                    self.logger.error(f"Failed to rollback role assignment: {rollback_error}")
+                return  # Abort - don't reset leaderboards
+            
+            # Step 3: Notify winner (NON-CRITICAL - can fail without aborting)
+            try:
+                await self._notify_winner(
+                    guild,
+                    winner['user_id'],
+                    winner['score'],
+                    winner['chat_weekly'],
+                    winner['voice_weekly']
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"⚠️ Failed to notify star winner in {guild.name}: {e}. "
+                    f"Continuing with reset (notification is not critical)."
+                )
+            
+            # Step 4: Reset weekly leaderboards (ONLY if all critical steps succeeded)
+            await self._reset_weekly_leaderboards(guild.id)
+            
+            self.logger.info(
+                f"✅ Star of the Week complete for {guild.name}: "
+                f"User {winner['user_id']} with score {winner['score']:.1f}. "
+                f"Weekly leaderboards have been reset."
             )
-            
-            # Notify winner
-            await self._notify_winner(
-                guild,
-                winner['user_id'],
-                winner['score'],
-                winner['chat_weekly'],
-                winner['voice_weekly']
-            )
-            
-            print(f"✅ Star of the Week selected for {guild.name}: User {winner['user_id']}")
         
         except Exception as e:
-            print(f"❌ Error processing Star selection for {guild.name}: {e}")
+            self.logger.error(f"Error processing Star selection for {guild.name}: {e}", exc_info=True)
     
     # ==================== CONSOLIDATED SLASH COMMAND ====================
     
@@ -546,14 +878,14 @@ class StarOfTheWeekCog(commands.Cog):
             )
             
             await interaction.followup.send(response, ephemeral=True)
-            print(f"✅ Star of the Week configured for guild {interaction.guild.id}")
+            self.logger.info(f"Star of the Week configured for guild {interaction.guild.id} by {interaction.user}")
         
         except Exception as e:
             await interaction.followup.send(
                 f"❌ Error configuring Star of the Week: {e}",
                 ephemeral=True
             )
-            print(f"❌ Setup error: {e}")
+            self.logger.error(f"Setup error for guild {interaction.guild.id}: {e}", exc_info=True)
     
     @star_group.command(name="history", description="View past Star of the Week winners")
     @app_commands.describe(limit="Number of past winners to show (default: 5)")
@@ -625,6 +957,201 @@ class StarOfTheWeekCog(commands.Cog):
                 f"❌ Error fetching history: {e}",
                 ephemeral=True
             )
+    
+    @star_group.command(name="diagnose", description="[ADMIN] Check Star of the Week system configuration and permissions")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def star_diagnose(self, interaction: discord.Interaction):
+        """
+        Diagnose Star of the Week system configuration.
+        
+        Checks permissions, role hierarchy, and configuration.
+        """
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            issues = []
+            warnings = []
+            info = []
+            
+            # Check configuration
+            star_config = await self._get_star_config(interaction.guild.id)
+            if not star_config:
+                issues.append("❌ Star of the Week not configured! Use `/star setup` first.")
+                await interaction.followup.send("\n".join(issues), ephemeral=True)
+                return
+            
+            role_id = star_config.get('role_id')
+            announce_channel_id = star_config.get('announce_channel_id')
+            weight_chat = star_config.get('weight_chat', 1.0)
+            weight_voice = star_config.get('weight_voice', 2.0)
+            
+            info.append(f"✅ Star system is configured")
+            info.append(f"📊 Weights: Chat={weight_chat}, Voice={weight_voice}")
+            
+            # Check role exists
+            role = interaction.guild.get_role(role_id)
+            if not role:
+                issues.append(f"❌ Star role (ID: {role_id}) not found! It may have been deleted.")
+            else:
+                info.append(f"✅ Star role found: {role.mention} (Position: {role.position})")
+                
+                # Check bot permissions
+                bot_member = interaction.guild.get_member(self.bot.user.id)
+                if bot_member:
+                    if not bot_member.guild_permissions.manage_roles:
+                        issues.append("❌ Bot lacks 'Manage Roles' permission!")
+                    else:
+                        info.append("✅ Bot has 'Manage Roles' permission")
+                    
+                    # Check role hierarchy
+                    bot_top_role = bot_member.top_role
+                    if bot_top_role.position <= role.position:
+                        issues.append(
+                            f"❌ **ROLE HIERARCHY ERROR**\n"
+                            f"   Bot's highest role: **{bot_top_role.name}** (Position: {bot_top_role.position})\n"
+                            f"   Star role: **{role.name}** (Position: {role.position})\n"
+                            f"   **Fix:** Move the bot's role ABOVE the Star role in Server Settings > Roles"
+                        )
+                    else:
+                        info.append(f"✅ Role hierarchy correct (Bot: {bot_top_role.position} > Star: {role.position})")
+            
+            # Check announcement channel
+            if announce_channel_id:
+                channel = interaction.guild.get_channel(announce_channel_id)
+                if not channel:
+                    warnings.append(f"⚠️ Announcement channel (ID: {announce_channel_id}) not found")
+                else:
+                    info.append(f"✅ Announcement channel: {channel.mention}")
+            else:
+                info.append("ℹ️ No announcement channel (DM only)")
+            
+            # Check for active users
+            stats = await self._get_weekly_stats(interaction.guild.id)
+            if stats:
+                info.append(f"✅ {len(stats)} users with activity this week")
+            else:
+                warnings.append("⚠️ No users with activity this week")
+            
+            # Check previous winner
+            previous_winner = await self._get_previous_winner(interaction.guild.id)
+            if previous_winner:
+                time_since = datetime.utcnow() - previous_winner['awarded_at']
+                days = time_since.days
+                hours = time_since.seconds // 3600
+                info.append(f"ℹ️ Last selection: {days}d {hours}h ago")
+                
+                # Check if previous winner still has the role
+                if role:
+                    prev_member = interaction.guild.get_member(previous_winner['user_id'])
+                    if prev_member:
+                        if role in prev_member.roles:
+                            info.append(f"✅ Previous winner {prev_member.mention} still has the role")
+                        else:
+                            warnings.append(f"⚠️ Previous winner {prev_member.mention} doesn't have the role anymore")
+            else:
+                info.append("ℹ️ No previous winner (first selection)")
+            
+            # Build response
+            response = "# 🔍 Star of the Week Diagnostics\n\n"
+            
+            if issues:
+                response += "## ❌ Critical Issues\n" + "\n".join(issues) + "\n\n"
+            
+            if warnings:
+                response += "## ⚠️ Warnings\n" + "\n".join(warnings) + "\n\n"
+            
+            if info:
+                response += "## ℹ️ System Status\n" + "\n".join(info) + "\n\n"
+            
+            if not issues:
+                response += "\n✅ **System is ready for Star selection!**\n"
+                response += "Use `/star force-select` to trigger selection manually."
+            else:
+                response += "\n❌ **Fix the issues above before running selection.**"
+            
+            await interaction.followup.send(response, ephemeral=True)
+        
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Error during diagnostics: {e}",
+                ephemeral=True
+            )
+            self.logger.error(f"Diagnose error: {e}", exc_info=True)
+    
+    @star_group.command(name="force-select", description="[ADMIN] Manually trigger Star of the Week selection now")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def star_force_select(self, interaction: discord.Interaction):
+        """
+        Manually trigger Star of the Week selection immediately.
+        
+        Admin only command for testing or recovering from failed selections.
+        """
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Check if star system is configured
+            star_config = await self._get_star_config(interaction.guild.id)
+            if not star_config:
+                await interaction.followup.send(
+                    "❌ Star of the Week not configured! Use `/star setup` first.",
+                    ephemeral=True
+                )
+                return
+            
+            # Send initial message
+            await interaction.followup.send(
+                "🔄 **Starting Star of the Week selection...**\n"
+                "This may take a few seconds. Check logs for detailed progress.",
+                ephemeral=True
+            )
+            
+            # Trigger selection
+            await self._process_star_selection(interaction.guild)
+            
+            # Check if it succeeded by looking at the most recent winner
+            previous_winner = await self._get_previous_winner(interaction.guild.id)
+            if previous_winner:
+                time_since_last = datetime.utcnow() - previous_winner['awarded_at']
+                if time_since_last < timedelta(minutes=5):
+                    # Selection just happened
+                    member = interaction.guild.get_member(previous_winner['user_id'])
+                    username = member.mention if member else f"<@{previous_winner['user_id']}>"
+                    
+                    await interaction.followup.send(
+                        f"✅ **Star of the Week selection complete!**\n\n"
+                        f"🏆 Winner: {username}\n"
+                        f"📊 Score: {previous_winner['score']:.1f}\n"
+                        f"💬 Messages: {previous_winner['chat_weekly']:,}\n"
+                        f"🎤 Voice: {previous_winner['voice_weekly']:.1f} minutes\n\n"
+                        f"Check the logs for detailed information.",
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        "⚠️ **Selection may have failed.**\n"
+                        "Check the bot logs for error messages. Common issues:\n"
+                        "• Bot role is below the Star role in hierarchy\n"
+                        "• Bot lacks 'Manage Roles' permission\n"
+                        "• No users with activity this week",
+                        ephemeral=True
+                    )
+            else:
+                await interaction.followup.send(
+                    "⚠️ **No winner selected.**\n"
+                    "Possible reasons:\n"
+                    "• No users with activity this week\n"
+                    "• Role assignment failed (check logs)\n"
+                    "• All users are bots",
+                    ephemeral=True
+                )
+        
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ **Error during selection:** {e}\n"
+                f"Check bot logs for details.",
+                ephemeral=True
+            )
+            self.logger.error(f"Force select error: {e}", exc_info=True)
     
     @star_group.command(name="preview", description="Preview current week's top candidates")
     async def star_preview(self, interaction: discord.Interaction):
