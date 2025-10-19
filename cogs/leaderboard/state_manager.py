@@ -245,8 +245,10 @@ class BulletproofStateManager:
                 {'guild_id': guild_id},
                 {
                     '$set': {
-                        'last_star_selection': datetime.utcnow(),
-                        'star_selection_count': {'$inc': 1}
+                        'last_star_selection': datetime.utcnow()
+                    },
+                    '$inc': {
+                        'star_selection_count': 1
                     }
                 },
                 upsert=True

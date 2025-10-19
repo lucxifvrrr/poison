@@ -141,6 +141,7 @@ class ChatLeaderboardCog(commands.Cog):
         self.last_daily_reset = {}  # {guild_id: datetime}
         self.last_weekly_reset = {}  # {guild_id: datetime}
         self.last_monthly_reset = {}  # {guild_id: datetime}
+        self.last_update_time = {}  # {guild_id: datetime} - track when leaderboard was last updated
         self.logger = logging.getLogger('discord.bot.chat_leaderboard')
     
     async def cog_load(self):
@@ -406,7 +407,7 @@ class ChatLeaderboardCog(commands.Cog):
             # Truncate long usernames to prevent display issues
             if len(username) > 20:
                 username = username[:17] + "..."
-            leaderboard_lines.append(f"- `{idx:02d}` | {Emojis.USER} `{username}` {Emojis.ARROW} `{count:,} messages`")
+            leaderboard_lines.append(f"- `{idx:02d}` | `{username}` {Emojis.ARROW} `{count:,} messages`")
         
         leaderboard_text = "\n".join(leaderboard_lines) if leaderboard_lines else "No data yet"
         
@@ -445,7 +446,10 @@ class ChatLeaderboardCog(commands.Cog):
             next_reset = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
         elif period == 'weekly':
             days_until_sunday = (LeaderboardSettings.WEEKLY_RESET_DAY - now.weekday()) % 7
-            if days_until_sunday == 0 and now.hour >= LeaderboardSettings.WEEKLY_RESET_HOUR:
+            # Calculate the reset time for this week
+            this_week_reset = now.replace(hour=LeaderboardSettings.WEEKLY_RESET_HOUR, minute=0, second=0, microsecond=0)
+            # If it's Sunday (days_until_sunday == 0) and we're past the reset time, go to next week
+            if days_until_sunday == 0 and now >= this_week_reset:
                 days_until_sunday = 7
             next_reset = now.replace(hour=LeaderboardSettings.WEEKLY_RESET_HOUR, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
         else:  # monthly
@@ -489,7 +493,7 @@ class ChatLeaderboardCog(commands.Cog):
         )
         
         # Create embed
-        embed = discord.Embed(description=description, color=EMBED_COLOR, timestamp=datetime.utcnow())
+        embed = discord.Embed(description=description, color=EMBED_COLOR)
         
         # Footer
         footer_text = ChatTemplates.FOOTER_TEXT
@@ -556,8 +560,10 @@ class ChatLeaderboardCog(commands.Cog):
     @tasks.loop(minutes=5)
     async def update_leaderboards(self):
         try:
+            self.logger.info("Chat leaderboard update task running...")
             cursor = self.db.guild_configs.find({'chat_enabled': True})
             configs = await cursor.to_list(length=1000)
+            self.logger.info(f"Found {len(configs)} guilds with chat leaderboard enabled")
             for config in configs:
                 guild_id = config['guild_id']
                 guild = self.bot.get_guild(guild_id)
@@ -601,9 +607,13 @@ class ChatLeaderboardCog(commands.Cog):
                                     daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
                                     daily_view = LeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
                                     await daily_message.edit(embed=daily_embed, view=daily_view)
+                                    self.logger.debug(f"Updated daily leaderboard for guild {guild_id}")
                                 else:
                                     messages_missing = True
                             except discord.NotFound:
+                                messages_missing = True
+                            except Exception as e:
+                                self.logger.error(f"Error updating daily message for guild {guild_id}: {e}")
                                 messages_missing = True
                         
                         # Update weekly message
@@ -637,6 +647,10 @@ class ChatLeaderboardCog(commands.Cog):
                             self.logger.info(f"Chat leaderboard messages missing or invalid for guild {guild_id}, recreating")
                             await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'chat'})
                             await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                        else:
+                            # Track successful update
+                            self.last_update_time[guild_id] = datetime.utcnow()
+                            self.logger.info(f"Successfully updated all chat leaderboards for guild {guild_id}")
                             
                     except discord.Forbidden as e:
                         self.logger.error(
@@ -850,6 +864,210 @@ class ChatLeaderboardCog(commands.Cog):
             self.logger.info(f"Archived and reset weekly chat stats for guild {guild_id}")
         except Exception as e:
             self.logger.error(f"Error resetting weekly stats for guild {guild_id}: {e}", exc_info=True)
+    
+    @app_commands.command(name="leaderboard-refresh", description="[ADMIN] Force refresh chat leaderboard now")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def refresh_leaderboard(self, interaction: discord.Interaction):
+        """Force refresh the chat leaderboard immediately"""
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            guild_id = interaction.guild.id
+            
+            # Check configuration
+            config = await self._get_guild_config(guild_id)
+            if not config or not config.get('chat_enabled'):
+                await interaction.followup.send("❌ Chat leaderboard not enabled! Use `/live-leaderboard action:Enable` first.", ephemeral=True)
+                return
+            
+            # Get message data
+            msg_data = await self._get_leaderboard_message(guild_id)
+            if not msg_data:
+                await interaction.followup.send("❌ No leaderboard messages found! Use `/live-leaderboard action:Setup` first.", ephemeral=True)
+                return
+            
+            channel = interaction.guild.get_channel(msg_data['channel_id'])
+            if not channel:
+                await interaction.followup.send(f"❌ Leaderboard channel not found!", ephemeral=True)
+                return
+            
+            vibe_channel_id = config.get('vibe_channel_id')
+            
+            # Get message IDs
+            daily_id = msg_data.get('daily_message_id')
+            weekly_id = msg_data.get('weekly_message_id')
+            monthly_id = msg_data.get('monthly_message_id')
+            
+            updated = []
+            errors = []
+            
+            # Update daily
+            if daily_id:
+                try:
+                    daily_message = await channel.fetch_message(daily_id)
+                    daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
+                    daily_view = LeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
+                    await daily_message.edit(embed=daily_embed, view=daily_view)
+                    updated.append("Daily")
+                except Exception as e:
+                    errors.append(f"Daily: {e}")
+            
+            # Update weekly
+            if weekly_id:
+                try:
+                    weekly_message = await channel.fetch_message(weekly_id)
+                    weekly_embed = await self._build_period_embed(guild_id, 'weekly', page=0)
+                    weekly_view = LeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
+                    await weekly_message.edit(embed=weekly_embed, view=weekly_view)
+                    updated.append("Weekly")
+                except Exception as e:
+                    errors.append(f"Weekly: {e}")
+            
+            # Update monthly
+            if monthly_id:
+                try:
+                    monthly_message = await channel.fetch_message(monthly_id)
+                    monthly_embed = await self._build_period_embed(guild_id, 'monthly', page=0)
+                    monthly_view = LeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
+                    await monthly_message.edit(embed=monthly_embed, view=monthly_view)
+                    updated.append("Monthly")
+                except Exception as e:
+                    errors.append(f"Monthly: {e}")
+            
+            # Build response
+            response = "# 🔄 Leaderboard Refresh Complete\n\n"
+            if updated:
+                response += f"✅ **Updated:** {', '.join(updated)}\n"
+            if errors:
+                response += f"\n❌ **Errors:**\n" + "\n".join(f"• {err}" for err in errors)
+            
+            # Show current stats
+            active_daily = await self.db.user_stats.count_documents({'guild_id': guild_id, 'chat_daily': {'$gt': 0}})
+            top_users = await self._get_top_users(guild_id, 'daily', limit=1)
+            
+            response += f"\n\n📊 **Current Stats:**\n"
+            response += f"• Active users today: {active_daily}\n"
+            if top_users:
+                top_user = top_users[0]
+                member = interaction.guild.get_member(top_user['user_id'])
+                username = member.display_name if member else f"User {top_user['user_id']}"
+                response += f"• Top user: {username} with {top_user.get('chat_daily', 0)} messages\n"
+            
+            await interaction.followup.send(response, ephemeral=True)
+        
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error during refresh: {e}", ephemeral=True)
+            self.logger.error(f"Refresh command error: {e}", exc_info=True)
+    
+    @app_commands.command(name="leaderboard-debug", description="[ADMIN] Debug chat leaderboard system")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def debug_leaderboard(self, interaction: discord.Interaction):
+        """Diagnose chat leaderboard issues"""
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            guild_id = interaction.guild.id
+            
+            # Check configuration
+            config = await self._get_guild_config(guild_id)
+            if not config:
+                await interaction.followup.send("❌ No configuration found! Use `/live-leaderboard action:Setup` first.", ephemeral=True)
+                return
+            
+            debug_info = "# 🔍 Chat Leaderboard Debug Info\n\n"
+            
+            # Configuration status
+            debug_info += "## ⚙️ Configuration\n"
+            debug_info += f"✅ Config exists\n"
+            debug_info += f"**Enabled:** {'✅ Yes' if config.get('chat_enabled') else '❌ No'}\n"
+            debug_info += f"**Timezone:** `{config.get('timezone', 'UTC')}`\n"
+            
+            chat_channel_id = config.get('chat_channel_id')
+            if chat_channel_id:
+                channel = interaction.guild.get_channel(chat_channel_id)
+                if channel:
+                    debug_info += f"**Channel:** {channel.mention} (ID: {chat_channel_id})\n"
+                else:
+                    debug_info += f"**Channel:** ❌ Not found (ID: {chat_channel_id})\n"
+            else:
+                debug_info += f"**Channel:** ❌ Not configured\n"
+            
+            # Task status
+            debug_info += f"\n## 🔄 Background Tasks\n"
+            debug_info += f"**Update Task:** {'✅ Running' if self.update_leaderboards.is_running() else '❌ NOT RUNNING'}\n"
+            if self.update_leaderboards.is_running():
+                debug_info += f"**Task Loop Count:** {self.update_leaderboards.current_loop}\n"
+                last_update = self.last_update_time.get(guild_id)
+                if last_update:
+                    time_since = datetime.utcnow() - last_update
+                    minutes_ago = int(time_since.total_seconds() / 60)
+                    debug_info += f"**Last Update:** {minutes_ago} minute(s) ago\n"
+                else:
+                    debug_info += f"**Last Update:** Never (or bot just restarted)\n"
+            debug_info += f"**Daily Reset:** {'✅ Running' if self.daily_reset.is_running() else '❌ NOT RUNNING'}\n"
+            debug_info += f"**Weekly Reset:** {'✅ Running' if self.weekly_reset.is_running() else '❌ NOT RUNNING'}\n"
+            debug_info += f"**Monthly Reset:** {'✅ Running' if self.monthly_reset.is_running() else '❌ NOT RUNNING'}\n"
+            
+            # Check message data
+            msg_data = await self._get_leaderboard_message(guild_id)
+            debug_info += f"\n## 📨 Leaderboard Messages\n"
+            if msg_data:
+                debug_info += f"**Channel ID:** {msg_data.get('channel_id')}\n"
+                debug_info += f"**Daily Message ID:** {msg_data.get('daily_message_id', 'Not set')}\n"
+                debug_info += f"**Weekly Message ID:** {msg_data.get('weekly_message_id', 'Not set')}\n"
+                debug_info += f"**Monthly Message ID:** {msg_data.get('monthly_message_id', 'Not set')}\n"
+            else:
+                debug_info += f"❌ No message data found in database\n"
+            
+            # Check user stats
+            stats_count = await self.db.user_stats.count_documents({'guild_id': guild_id})
+            active_daily = await self.db.user_stats.count_documents({'guild_id': guild_id, 'chat_daily': {'$gt': 0}})
+            active_weekly = await self.db.user_stats.count_documents({'guild_id': guild_id, 'chat_weekly': {'$gt': 0}})
+            active_monthly = await self.db.user_stats.count_documents({'guild_id': guild_id, 'chat_monthly': {'$gt': 0}})
+            
+            debug_info += f"\n## 📊 User Statistics\n"
+            debug_info += f"**Total Users Tracked:** {stats_count}\n"
+            debug_info += f"**Active Today:** {active_daily}\n"
+            debug_info += f"**Active This Week:** {active_weekly}\n"
+            debug_info += f"**Active This Month:** {active_monthly}\n"
+            
+            # Get top user for verification
+            top_users = await self._get_top_users(guild_id, 'daily', limit=1)
+            if top_users:
+                top_user = top_users[0]
+                member = interaction.guild.get_member(top_user['user_id'])
+                username = member.display_name if member else f"User {top_user['user_id']}"
+                debug_info += f"\n**Top User Today:** {username} with {top_user.get('chat_daily', 0)} messages\n"
+            
+            # Check on_message listener
+            debug_info += f"\n## 👂 Event Listeners\n"
+            debug_info += f"**on_message:** ✅ Registered\n"
+            debug_info += f"**Bot User ID:** {self.bot.user.id}\n"
+            
+            # Database connection
+            debug_info += f"\n## 💾 Database\n"
+            try:
+                await self.db.command('ping')
+                debug_info += f"**Connection:** ✅ Active\n"
+            except Exception as e:
+                debug_info += f"**Connection:** ❌ Error: {e}\n"
+            
+            # Recommendations
+            debug_info += f"\n## 💡 Recommendations\n"
+            if not config.get('chat_enabled'):
+                debug_info += f"⚠️ Enable the leaderboard with `/live-leaderboard action:Enable`\n"
+            if not self.update_leaderboards.is_running():
+                debug_info += f"⚠️ Update task not running - restart the bot\n"
+            if not msg_data:
+                debug_info += f"⚠️ No leaderboard messages - run `/live-leaderboard action:Setup`\n"
+            if active_daily == 0:
+                debug_info += f"⚠️ No activity tracked today - send some messages to test\n"
+            
+            await interaction.followup.send(debug_info, ephemeral=True)
+        
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error during debug: {e}", ephemeral=True)
+            self.logger.error(f"Debug command error: {e}", exc_info=True)
     
     @app_commands.command(name="live-leaderboard", description="Setup or toggle live chat leaderboard")
     @app_commands.describe(

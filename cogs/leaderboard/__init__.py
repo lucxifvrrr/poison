@@ -33,17 +33,9 @@ async def setup(bot):
     await bot.add_cog(DebugCommands(bot))
     logger.info("✅ Debug commands loaded")
     
-    # Run recovery check after all cogs are loaded
-    if hasattr(bot, 'mongo_client') and bot.mongo_client:
-        db = bot.mongo_client['poison_bot']
-        recovery_manager = RecoveryManager(db)
-        
-        # Schedule recovery to run after bot is fully ready
-        @bot.event
-        async def on_ready():
-            logger.info("🔄 Running startup recovery check...")
-            await recovery_manager.run_startup_recovery(bot)
-            logger.info("✅ Startup recovery complete")
+    # Note: Recovery check runs automatically in StarOfTheWeekCog.on_ready()
+    # Each cog has its own on_ready listener to start tasks independently
+    # This prevents event handler conflicts and ensures proper initialization
     
     logger.info("🛡️ BULLETPROOF LEADERBOARD SYSTEM INITIALIZED")
     logger.info("📊 Checks run every 5 minutes")

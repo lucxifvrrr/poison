@@ -520,7 +520,7 @@ class VoiceLeaderboardCog(commands.Cog):
             # Truncate long usernames
             if len(username) > 20:
                 username = username[:17] + "..."
-            leaderboard_lines.append(f"- `{idx:02d}` | {Emojis.USER} `{username}` {Emojis.ARROW} `{time_str}`")
+            leaderboard_lines.append(f"- `{idx:02d}` | `{username}` {Emojis.ARROW} `{time_str}`")
         
         leaderboard_text = "\n".join(leaderboard_lines) if leaderboard_lines else "No data yet"
         
@@ -560,7 +560,10 @@ class VoiceLeaderboardCog(commands.Cog):
             next_reset = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
         elif period == 'weekly':
             days_until_sunday = (LeaderboardSettings.WEEKLY_RESET_DAY - now.weekday()) % 7
-            if days_until_sunday == 0 and now.hour >= LeaderboardSettings.WEEKLY_RESET_HOUR:
+            # Calculate the reset time for this week
+            this_week_reset = now.replace(hour=LeaderboardSettings.WEEKLY_RESET_HOUR, minute=0, second=0, microsecond=0)
+            # If it's Sunday (days_until_sunday == 0) and we're past the reset time, go to next week
+            if days_until_sunday == 0 and now >= this_week_reset:
                 days_until_sunday = 7
             next_reset = now.replace(hour=LeaderboardSettings.WEEKLY_RESET_HOUR, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
         else:  # monthly
@@ -614,7 +617,7 @@ class VoiceLeaderboardCog(commands.Cog):
         )
         
         # Create embed
-        embed = discord.Embed(description=description, color=EMBED_COLOR, timestamp=datetime.utcnow())
+        embed = discord.Embed(description=description, color=EMBED_COLOR)
         
         # Footer
         footer_text = VoiceTemplates.FOOTER_TEXT
@@ -1135,6 +1138,117 @@ class VoiceLeaderboardCog(commands.Cog):
             self.logger.info(f"Archived and reset weekly voice stats for guild {guild_id}")
         except Exception as e:
             self.logger.error(f"Error resetting weekly stats for guild {guild_id}: {e}", exc_info=True)
+    
+    @app_commands.command(name="voice-leaderboard-debug", description="[ADMIN] Debug voice leaderboard system")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def debug_voice_leaderboard(self, interaction: discord.Interaction):
+        """Diagnose voice leaderboard issues"""
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            guild_id = interaction.guild.id
+            
+            # Check configuration
+            config = await self._get_guild_config(guild_id)
+            if not config:
+                await interaction.followup.send("❌ No configuration found! Use `/live-leaderboard-voice action:Setup` first.", ephemeral=True)
+                return
+            
+            debug_info = "# 🔍 Voice Leaderboard Debug Info\n\n"
+            
+            # Configuration status
+            debug_info += "## ⚙️ Configuration\n"
+            debug_info += f"✅ Config exists\n"
+            debug_info += f"**Enabled:** {'✅ Yes' if config.get('voice_enabled') else '❌ No'}\n"
+            debug_info += f"**Timezone:** `{config.get('timezone', 'UTC')}`\n"
+            
+            voice_channel_id = config.get('voice_channel_id')
+            if voice_channel_id:
+                channel = interaction.guild.get_channel(voice_channel_id)
+                if channel:
+                    debug_info += f"**Channel:** {channel.mention} (ID: {voice_channel_id})\n"
+                else:
+                    debug_info += f"**Channel:** ❌ Not found (ID: {voice_channel_id})\n"
+            else:
+                debug_info += f"**Channel:** ❌ Not configured\n"
+            
+            # Task status
+            debug_info += f"\n## 🔄 Background Tasks\n"
+            debug_info += f"**Update Task:** {'✅ Running' if self.update_leaderboards.is_running() else '❌ NOT RUNNING'}\n"
+            debug_info += f"**Daily Reset:** {'✅ Running' if self.daily_reset.is_running() else '❌ NOT RUNNING'}\n"
+            debug_info += f"**Weekly Reset:** {'✅ Running' if self.weekly_reset.is_running() else '❌ NOT RUNNING'}\n"
+            debug_info += f"**Monthly Reset:** {'✅ Running' if self.monthly_reset.is_running() else '❌ NOT RUNNING'}\n"
+            debug_info += f"**Save Sessions:** {'✅ Running' if self.save_voice_sessions_periodically.is_running() else '❌ NOT RUNNING'}\n"
+            debug_info += f"**Session Cleanup:** {'✅ Running' if self.periodic_session_cleanup.is_running() else '❌ NOT RUNNING'}\n"
+            
+            # Check message data
+            msg_data = await self._get_leaderboard_message(guild_id)
+            debug_info += f"\n## 📨 Leaderboard Messages\n"
+            if msg_data:
+                debug_info += f"**Channel ID:** {msg_data.get('channel_id')}\n"
+                debug_info += f"**Daily Message ID:** {msg_data.get('daily_message_id', 'Not set')}\n"
+                debug_info += f"**Weekly Message ID:** {msg_data.get('weekly_message_id', 'Not set')}\n"
+                debug_info += f"**Monthly Message ID:** {msg_data.get('monthly_message_id', 'Not set')}\n"
+            else:
+                debug_info += f"❌ No message data found in database\n"
+            
+            # Check user stats
+            stats_count = await self.db.user_stats.count_documents({'guild_id': guild_id})
+            active_daily = await self.db.user_stats.count_documents({'guild_id': guild_id, 'voice_daily': {'$gt': 0}})
+            active_weekly = await self.db.user_stats.count_documents({'guild_id': guild_id, 'voice_weekly': {'$gt': 0}})
+            active_monthly = await self.db.user_stats.count_documents({'guild_id': guild_id, 'voice_monthly': {'$gt': 0}})
+            
+            debug_info += f"\n## 📊 User Statistics\n"
+            debug_info += f"**Total Users Tracked:** {stats_count}\n"
+            debug_info += f"**Active Today:** {active_daily}\n"
+            debug_info += f"**Active This Week:** {active_weekly}\n"
+            debug_info += f"**Active This Month:** {active_monthly}\n"
+            
+            # Check active voice sessions
+            active_sessions = len(self.voice_sessions.get(guild_id, {}))
+            debug_info += f"**Active Voice Sessions:** {active_sessions}\n"
+            
+            # Get top user for verification
+            top_users = await self._get_top_users(guild_id, 'daily', limit=1)
+            if top_users:
+                top_user = top_users[0]
+                member = interaction.guild.get_member(top_user['user_id'])
+                username = member.display_name if member else f"User {top_user['user_id']}"
+                minutes = top_user.get('voice_daily', 0)
+                hours = int(minutes // 60)
+                mins = int(minutes % 60)
+                time_str = f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
+                debug_info += f"\n**Top User Today:** {username} with {time_str}\n"
+            
+            # Check voice state listener
+            debug_info += f"\n## 👂 Event Listeners\n"
+            debug_info += f"**on_voice_state_update:** ✅ Registered\n"
+            debug_info += f"**Bot User ID:** {self.bot.user.id}\n"
+            
+            # Database connection
+            debug_info += f"\n## 💾 Database\n"
+            try:
+                await self.db.command('ping')
+                debug_info += f"**Connection:** ✅ Active\n"
+            except Exception as e:
+                debug_info += f"**Connection:** ❌ Error: {e}\n"
+            
+            # Recommendations
+            debug_info += f"\n## 💡 Recommendations\n"
+            if not config.get('voice_enabled'):
+                debug_info += f"⚠️ Enable the leaderboard with `/live-leaderboard-voice action:Enable`\n"
+            if not self.update_leaderboards.is_running():
+                debug_info += f"⚠️ Update task not running - restart the bot\n"
+            if not msg_data:
+                debug_info += f"⚠️ No leaderboard messages - run `/live-leaderboard-voice action:Setup`\n"
+            if active_daily == 0 and active_sessions == 0:
+                debug_info += f"⚠️ No activity tracked today - join a voice channel to test\n"
+            
+            await interaction.followup.send(debug_info, ephemeral=True)
+        
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error during debug: {e}", ephemeral=True)
+            self.logger.error(f"Voice debug command error: {e}", exc_info=True)
     
     @app_commands.command(name="live-leaderboard-voice", description="Setup or toggle live voice leaderboard")
     @app_commands.describe(

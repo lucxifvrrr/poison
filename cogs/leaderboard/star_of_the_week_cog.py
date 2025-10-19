@@ -45,6 +45,7 @@ import pytz
 from dotenv import load_dotenv
 import logging
 from .state_manager import BulletproofStateManager, RecoveryManager
+from .leaderboard_config import Emojis, Images
 
 load_dotenv()
 
@@ -593,9 +594,9 @@ class StarOfTheWeekCog(commands.Cog):
             title=f"{Emojis.STAR} Star of the Week!",
             description=(
                 f"Congrats! You're **{guild.name}'s** Star!\n\n"
-                f"{Emojis.MOON} **Messages:** `{chat_count:,}`\n"
-                f"{Emojis.MIC} **Voice:** `{voice_str}`\n"
-                f"{Emojis.TROPHY} **Score:** `{score:.0f}`\n\n"
+                f"{Emojis.OGS_SYMBO} **Messages:** `{chat_count:,}`\n"
+                f"{Emojis.OGS_SYMBO} **Voice:** `{voice_str}`\n"
+                f"{Emojis.OGS_SYMBO} **Score:** `{score:.0f}`\n\n"
                 f"{Emojis.HEARTSPARK} Keep being awesome!"
             ),
             color=0xFFD700,  # Gold color
@@ -764,9 +765,13 @@ class StarOfTheWeekCog(commands.Cog):
                         # Select Star of the Week
                         self.logger.info(f"Triggering Star selection for guild {guild_id}")
                         success = await self._process_star_selection(guild)
+                        # ALWAYS mark selection as complete to prevent infinite retries
+                        # Even if it failed, we don't want to retry every 5 minutes
+                        await self.state_manager.mark_star_selection_complete(guild_id)
                         if success:
-                            # Mark selection as complete in database
-                            await self.state_manager.mark_star_selection_complete(guild_id)
+                            self.logger.info(f"Star selection completed successfully for guild {guild_id}")
+                        else:
+                            self.logger.warning(f"Star selection failed or had no eligible users for guild {guild_id}, but marked as complete to prevent retries")
                 
                 except pytz.exceptions.UnknownTimeZoneError:
                     self.logger.error(f"Invalid timezone for guild {guild_id}: {tz_name}")
@@ -799,13 +804,13 @@ class StarOfTheWeekCog(commands.Cog):
             
             if not winner:
                 self.logger.warning(f"No eligible users for Star of the Week in {guild.name}")
-                return
+                return False  # Explicitly return False instead of None
             
             # Get Star config
             star_config = await self._get_star_config(guild.id)
             if not star_config:
                 self.logger.error(f"No Star config found for guild {guild.id}")
-                return
+                return False  # Explicitly return False instead of None
             
             # Step 1: Assign role (CRITICAL - must succeed)
             # This removes role from previous winner and assigns to new winner
@@ -821,7 +826,7 @@ class StarOfTheWeekCog(commands.Cog):
                     f"Aborting star selection to preserve leaderboard data. "
                     f"Please check role permissions and configuration, then try manual selection."
                 )
-                return  # STOP HERE - don't reset leaderboards if role wasn't assigned
+                return False  # STOP HERE - don't reset leaderboards if role wasn't assigned
             
             # Step 2: Save to history (CRITICAL - must succeed)
             try:
@@ -846,7 +851,7 @@ class StarOfTheWeekCog(commands.Cog):
                         self.logger.info(f"Rolled back role assignment for {member.display_name}")
                 except Exception as rollback_error:
                     self.logger.error(f"Failed to rollback role assignment: {rollback_error}")
-                return  # Abort - don't reset leaderboards
+                return False  # Abort - don't reset leaderboards
             
             # Step 3: Notify winner (NON-CRITICAL - can fail without aborting)
             try:
@@ -1071,8 +1076,17 @@ class StarOfTheWeekCog(commands.Cog):
                     next_selection_utc = next_selection.astimezone(pytz.UTC)
                     next_timestamp = int(next_selection_utc.timestamp())
                     
+                    # Calculate time until selection
+                    time_until = next_selection - now
+                    hours_until = int(time_until.total_seconds() / 3600)
+                    minutes_until = int((time_until.total_seconds() % 3600) / 60)
+                    
                     info.append(f"📅 Next automatic selection: <t:{next_timestamp}:F> (<t:{next_timestamp}:R>)")
+                    info.append(f"⏰ Time until selection: {hours_until}h {minutes_until}m")
                     info.append(f"🕐 Current server time: {now.strftime('%A %I:%M %p')} ({tz_name})")
+                    if tz_name != 'UTC':
+                        now_utc = datetime.now(pytz.UTC)
+                        info.append(f"🌍 Current UTC time: {now_utc.strftime('%A %I:%M %p')} (UTC)")
                 except Exception as e:
                     warnings.append(f"⚠️ Could not calculate next selection time: {e}")
             else:
@@ -1290,7 +1304,7 @@ class StarOfTheWeekCog(commands.Cog):
             # Task running status
             if self.weekly_star_selection.is_running():
                 status += "✅ **Task Status:** Running\n"
-                status += f"🔄 **Check Interval:** Every 1 hour\n"
+                status += f"🔄 **Check Interval:** Every 5 minutes\n"
             else:
                 status += "❌ **Task Status:** NOT RUNNING\n"
                 status += "⚠️ **Action Required:** Restart the bot\n\n"
@@ -1307,10 +1321,10 @@ class StarOfTheWeekCog(commands.Cog):
             
             # Selection trigger condition
             status += f"\n## 🎯 Selection Trigger\n"
-            status += f"**Triggers when:** Sunday (weekday=6) at hour=11\n"
+            status += f"**Triggers when:** Sunday (weekday=6) at hour=12 (noon)\n"
             status += f"**Current state:** weekday={now.weekday()}, hour={now.hour}\n"
             
-            if now.weekday() == 6 and now.hour == 11:
+            if now.weekday() == 6 and now.hour == 12:
                 status += f"✅ **RIGHT NOW is selection time!**\n"
                 
                 # Check if already selected
@@ -1326,10 +1340,10 @@ class StarOfTheWeekCog(commands.Cog):
             else:
                 # Calculate next selection
                 days_until_sunday = (6 - now.weekday()) % 7
-                if days_until_sunday == 0 and now.hour >= 11:
+                if days_until_sunday == 0 and now.hour >= 12:
                     days_until_sunday = 7
                 
-                next_selection = now.replace(hour=11, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
+                next_selection = now.replace(hour=12, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
                 time_until = next_selection - now
                 hours_until = int(time_until.total_seconds() / 3600)
                 

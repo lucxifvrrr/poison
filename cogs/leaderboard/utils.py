@@ -9,6 +9,13 @@ from typing import Optional, Union
 import pytz
 from datetime import datetime
 import logging
+import asyncio
+
+# Optional pymongo import for bulk operations
+try:
+    import pymongo
+except ImportError:
+    pymongo = None
 
 logger = logging.getLogger('discord.bot.leaderboard.utils')
 
@@ -139,6 +146,24 @@ class DatabaseTransactionManager:
         if not updates:
             return 0
         
+        if pymongo is None:
+            self.logger.warning("pymongo not available, falling back to individual updates")
+            # Fallback to individual updates
+            successful = 0
+            collection = self.db[collection_name]
+            for update in updates:
+                try:
+                    result = await collection.update_one(
+                        update['filter'],
+                        update['update'],
+                        upsert=update.get('upsert', False)
+                    )
+                    if result.acknowledged:
+                        successful += 1
+                except Exception as e:
+                    self.logger.error(f"Individual update failed: {e}")
+            return successful
+        
         successful = 0
         collection = self.db[collection_name]
         
@@ -259,12 +284,3 @@ class TaskSynchronizer:
             )
         except Exception as e:
             self.logger.error(f"Failed to mark reset complete: {e}")
-
-
-# Import guard for asyncio
-import asyncio
-try:
-    import pymongo
-except ImportError:
-    # pymongo not available, bulk operations will be limited
-    pymongo = None

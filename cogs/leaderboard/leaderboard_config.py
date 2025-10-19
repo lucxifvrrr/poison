@@ -23,6 +23,7 @@ class Emojis:
     USER = "<a:original_Peek:1429151221939441776>"  # Custom user emoji - UPDATE THIS WITH YOUR EMOJI ID
     TROPHY = "<:ogsstprize:1429349697817935962>"  # Trophy for champion
     STAR = "<:ogs_starr:1429348961885360149>"  # Star for winner
+    OGS_SYMBO = "<:ogs_symbo:1429051663766913165>"  # OGS symbol for stats
     
     # Button emojis
     LEFT_BUTTON_ID = 1426488800875380818
