@@ -12,6 +12,7 @@ from typing import Optional, List, Dict
 import pytz
 from dotenv import load_dotenv
 import logging
+import asyncio
 from .leaderboard_config import (
     EMBED_COLOR, Emojis, Images, ChatTemplates, 
     PeriodConfig, ButtonConfig, LeaderboardSettings
@@ -28,9 +29,10 @@ class LeaderboardPaginator(discord.ui.View):
         self.period = period
         self.page = page
         self.vibe_channel_id = vibe_channel_id
+        self.max_pages_cache = None  # Cache max pages to avoid repeated queries
         
-        # Initialize the view without timeout
-        super().__init__(timeout=None)
+        # Initialize the view with a reasonable timeout
+        super().__init__(timeout=300)  # 5 minutes timeout
         
         # Clear default buttons (they're added by decorators)
         self.clear_items()
@@ -103,12 +105,15 @@ class LeaderboardPaginator(discord.ui.View):
                 self.cog.logger.warning("Interaction already responded to in next_page")
                 return
             
-            stats = await self.cog._get_top_users(self.guild_id, self.period, limit=LeaderboardSettings.MAX_MEMBERS_FETCH)
-            if not stats:
-                await interaction.response.send_message("No data available!", ephemeral=True)
-                return
-            max_pages = max(0, (len(stats) - 1) // LeaderboardSettings.MEMBERS_PER_PAGE)
-            if self.page < max_pages:
+            # Use cached max_pages if available
+            if self.max_pages_cache is None:
+                stats = await self.cog._get_top_users(self.guild_id, self.period, limit=LeaderboardSettings.MAX_MEMBERS_FETCH)
+                if not stats:
+                    await interaction.response.send_message("No data available!", ephemeral=True)
+                    return
+                self.max_pages_cache = max(0, (len(stats) - 1) // LeaderboardSettings.MEMBERS_PER_PAGE)
+            
+            if self.page < self.max_pages_cache:
                 self.page += 1
                 # Update the embed for this period
                 new_embed = await self.cog._build_period_embed(self.guild_id, self.period, page=self.page)
@@ -228,9 +233,14 @@ class ChatLeaderboardCog(commands.Cog):
             
             # Weekly history indexes for archives
             await self.db.weekly_history.create_index([('guild_id', 1), ('type', 1), ('period', 1), ('reset_date', -1)])
-            await self.db.weekly_history.create_index([('reset_date', 1)])
             
             # TTL index to auto-delete archives older than 1 year (31536000 seconds)
+            # Drop any conflicting old index first
+            try:
+                await self.db.weekly_history.drop_index('reset_date_1')
+            except:
+                pass  # Index doesn't exist, that's fine
+            
             await self.db.weekly_history.create_index(
                 [('reset_date', 1)],
                 expireAfterSeconds=31536000,
@@ -248,16 +258,31 @@ class ChatLeaderboardCog(commands.Cog):
             await self.db.guild_configs.insert_one(config)
         return config
     
-    async def _increment_chat_count(self, guild_id: int, user_id: int):
-        """Increment chat count with error handling"""
-        try:
-            await self.db.user_stats.update_one(
-                {'guild_id': guild_id, 'user_id': user_id},
-                {'$inc': {'chat_daily': 1, 'chat_weekly': 1, 'chat_monthly': 1, 'chat_alltime': 1}, '$set': {'last_update': datetime.utcnow()}},
-                upsert=True
-            )
-        except Exception as e:
-            self.logger.error(f"Error incrementing chat count for user {user_id} in guild {guild_id}: {e}")
+    async def _increment_chat_count(self, guild_id: int, user_id: int, max_retries: int = 3):
+        """Increment chat count with retry logic and error handling"""
+        for attempt in range(max_retries):
+            try:
+                result = await self.db.user_stats.update_one(
+                    {'guild_id': guild_id, 'user_id': user_id},
+                    {
+                        '$inc': {
+                            'chat_daily': 1, 
+                            'chat_weekly': 1, 
+                            'chat_monthly': 1, 
+                            'chat_alltime': 1
+                        }, 
+                        '$set': {'last_update': datetime.utcnow()}
+                    },
+                    upsert=True
+                )
+                if result.acknowledged:
+                    return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                    self.logger.warning(f"Retry {attempt + 1}/{max_retries} for chat increment: {e}")
+                else:
+                    self.logger.error(f"Failed to increment chat count after {max_retries} attempts for user {user_id} in guild {guild_id}: {e}")
     
     async def _get_top_users(self, guild_id: int, period: str, limit: int = 100) -> List[Dict]:
         """Get top users with error handling and validation"""
@@ -274,13 +299,63 @@ class ChatLeaderboardCog(commands.Cog):
             self.logger.error(f"Error fetching top users for guild {guild_id}, period {period}: {e}")
             return []
     
+    async def _get_last_month_winner(self, guild_id: int) -> Optional[Dict]:
+        """Get last month's top active member from archive"""
+        try:
+            # Find the most recent monthly archive for this guild
+            cursor = self.db.weekly_history.find({
+                'guild_id': guild_id,
+                'type': 'chat',
+                'period': 'monthly'
+            }).sort('reset_date', -1).limit(1)
+            
+            archives = await cursor.to_list(length=1)
+            if not archives:
+                return None
+            
+            archive = archives[0]
+            stats = archive.get('stats', [])
+            
+            if not stats:
+                return None
+            
+            # Find the user with highest chat_monthly
+            top_user = max(stats, key=lambda x: x.get('chat_monthly', 0))
+            
+            if top_user.get('chat_monthly', 0) > 0:
+                return {
+                    'user_id': top_user['user_id'],
+                    'count': top_user['chat_monthly'],
+                    'month': archive['reset_date']
+                }
+            
+            return None
+        except Exception as e:
+            self.logger.error(f"Error fetching last month winner for guild {guild_id}: {e}")
+            return None
+    
     async def _get_leaderboard_message(self, guild_id: int) -> Optional[Dict]:
         return await self.db.leaderboard_messages.find_one({'guild_id': guild_id, 'type': 'chat'})
     
-    async def _save_leaderboard_message(self, guild_id: int, channel_id: int, message_id: int):
+    async def _save_leaderboard_messages(self, guild_id: int, channel_id: int, daily_id: int, weekly_id: int, monthly_id: int):
+        """Save all three leaderboard message IDs"""
         await self.db.leaderboard_messages.update_one(
             {'guild_id': guild_id, 'type': 'chat'},
-            {'$set': {'channel_id': channel_id, 'message_id': message_id, 'last_update': datetime.utcnow()}},
+            {'$set': {
+                'channel_id': channel_id,
+                'daily_message_id': daily_id,
+                'weekly_message_id': weekly_id,
+                'monthly_message_id': monthly_id,
+                'last_update': datetime.utcnow()
+            }},
+            upsert=True
+        )
+    
+    async def _save_leaderboard_message(self, guild_id: int, channel_id: int, message_id: int):
+        """Legacy method - kept for compatibility"""
+        await self.db.leaderboard_messages.update_one(
+            {'guild_id': guild_id, 'type': 'chat'},
+            {'$set': {'channel_id': channel_id, 'daily_message_id': message_id, 'last_update': datetime.utcnow()}},
             upsert=True
         )
     
@@ -322,11 +397,16 @@ class ChatLeaderboardCog(commands.Cog):
             if user:
                 username = user.display_name
             else:
-                # For users who left the server, show a shortened ID format
+                # For users who left the server, use a hash of their ID to avoid collisions
                 user_id_str = str(user_stat['user_id'])
-                username = f"User#{user_id_str[-4:]}"  # Show last 4 digits only
+                # Use last 6 digits plus a hash character for uniqueness
+                hash_char = chr(65 + (user_stat['user_id'] % 26))  # A-Z based on ID
+                username = f"User{hash_char}-{user_id_str[-6:]}"  # e.g., UserB-123456
             count = user_stat.get(f'chat_{period}', 0)
-            leaderboard_lines.append(f"- `{idx:02d}` | `{username}` {Emojis.ARROW} `{count:,} messages`")
+            # Truncate long usernames to prevent display issues
+            if len(username) > 20:
+                username = username[:17] + "..."
+            leaderboard_lines.append(f"- `{idx:02d}` | {Emojis.USER} `{username}` {Emojis.ARROW} `{count:,} messages`")
         
         leaderboard_text = "\n".join(leaderboard_lines) if leaderboard_lines else "No data yet"
         
@@ -338,9 +418,13 @@ class ChatLeaderboardCog(commands.Cog):
             if top_user:
                 top_user_name = top_user.display_name
             else:
-                # For users who left the server, show a shortened ID format
+                # For users who left the server, use consistent hash format
                 user_id_str = str(stats[0]['user_id'])
-                top_user_name = f"User#{user_id_str[-4:]}"  # Show last 4 digits only
+                hash_char = chr(65 + (stats[0]['user_id'] % 26))
+                top_user_name = f"User{hash_char}-{user_id_str[-6:]}"
+            # Truncate long names
+            if len(top_user_name) > 20:
+                top_user_name = top_user_name[:17] + "..."
             top_user_count = stats[0].get(f'chat_{period}', 0)
         
         # Period display
@@ -373,6 +457,24 @@ class ChatLeaderboardCog(commands.Cog):
         
         reset_timestamp = int(next_reset.timestamp())
         
+        # Get last month's winner for monthly embeds
+        last_month_winner_text = None
+        if period == 'monthly':
+            last_month_data = await self._get_last_month_winner(guild_id)
+            if last_month_data:
+                winner_member = guild.get_member(last_month_data['user_id'])
+                if winner_member:
+                    winner_name = winner_member.display_name
+                else:
+                    # User left, use hash format
+                    user_id_str = str(last_month_data['user_id'])
+                    hash_char = chr(65 + (last_month_data['user_id'] % 26))
+                    winner_name = f"User{hash_char}-{user_id_str[-6:]}"
+                
+                # Format the month name
+                month_name = last_month_data['month'].strftime('%B %Y')
+                last_month_winner_text = f"`{winner_name}` with `{last_month_data['count']:,} messages` in {month_name}"
+        
         # Build description using config template
         description = ChatTemplates.build_description(
             period_title=period_title,
@@ -382,7 +484,8 @@ class ChatLeaderboardCog(commands.Cog):
             top_user_count=top_user_count,
             leaderboard_text=leaderboard_text,
             reset_timestamp=reset_timestamp,
-            subtitle=subtitle
+            subtitle=subtitle,
+            last_month_winner=last_month_winner_text
         )
         
         # Create embed
@@ -411,32 +514,44 @@ class ChatLeaderboardCog(commands.Cog):
             # Send monthly embed with Join the Vibe button
             monthly_embed = await self._build_period_embed(guild_id, 'monthly', page=0)
             monthly_view = LeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
-            await channel.send(embed=monthly_embed, view=monthly_view)
+            monthly_message = await channel.send(embed=monthly_embed, view=monthly_view)
             
             # Send weekly embed with Join the Vibe button
             weekly_embed = await self._build_period_embed(guild_id, 'weekly', page=0)
             weekly_view = LeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
-            await channel.send(embed=weekly_embed, view=weekly_view)
+            weekly_message = await channel.send(embed=weekly_embed, view=weekly_view)
             
             # Send daily embed with pagination buttons
             daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
             daily_view = LeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
             daily_message = await channel.send(embed=daily_embed, view=daily_view)
             
-            # Save the daily message ID for updates
-            await self._save_leaderboard_message(guild_id, channel.id, daily_message.id)
+            # Save ALL message IDs for updates
+            await self._save_leaderboard_messages(guild_id, channel.id, daily_message.id, weekly_message.id, monthly_message.id)
             self.logger.info(f"Created chat leaderboard messages for guild {guild_id}")
         except Exception as e:
             self.logger.error(f"Failed to create leaderboard for guild {guild_id}: {e}", exc_info=True)
     
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        """Track chat messages with bot filtering and error handling"""
+        # Filter bots and DMs
         if message.author.bot or not message.guild:
             return
-        config = await self._get_guild_config(message.guild.id)
-        if not config or not config.get('chat_enabled'):
-            return
-        await self._increment_chat_count(message.guild.id, message.author.id)
+        
+        try:
+            config = await self._get_guild_config(message.guild.id)
+            if not config or not config.get('chat_enabled'):
+                return
+            
+            # Don't count messages in ignored channels if configured
+            ignored_channels = config.get('ignored_channels', [])
+            if message.channel.id in ignored_channels:
+                return
+            
+            await self._increment_chat_count(message.guild.id, message.author.id)
+        except Exception as e:
+            self.logger.error(f"Error processing message from {message.author.id} in guild {message.guild.id}: {e}")
     
     @tasks.loop(minutes=5)
     async def update_leaderboards(self):
@@ -450,46 +565,80 @@ class ChatLeaderboardCog(commands.Cog):
                     continue
                 try:
                     msg_data = await self._get_leaderboard_message(guild_id)
-                    if not msg_data:
-                        continue
-                    channel = guild.get_channel(msg_data['channel_id'])
-                    if not channel:
-                        continue
-                    
-                    # Get vibe_channel_id from config
                     vibe_channel_id = config.get('vibe_channel_id')
                     
-                    try:
-                        # Only update the daily message (we store the daily message ID)
-                        message = await channel.fetch_message(msg_data['message_id'])
-                        
-                        # Verify the bot owns this message
-                        if message.author.id != self.bot.user.id:
-                            self.logger.warning(
-                                f"Chat leaderboard message {msg_data['message_id']} in guild {guild_id} "
-                                f"is owned by {message.author} (ID: {message.author.id}), not this bot. "
-                                f"Removing invalid reference and recreating."
-                            )
-                            # Delete invalid reference from database
-                            await self.db.leaderboard_messages.delete_one({
-                                'guild_id': guild_id,
-                                'type': 'chat'
-                            })
-                            # Recreate leaderboard with correct bot ownership
-                            await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
-                            continue
-                        
-                        # Update the message
-                        daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
-                        daily_view = LeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
-                        await message.edit(embed=daily_embed, view=daily_view)
-                    except discord.NotFound:
-                        # If daily message not found, recreate all messages
-                        self.logger.info(f"Chat leaderboard message not found for guild {guild_id}, recreating")
+                    # If no message data exists, try to create messages if channel is configured
+                    if not msg_data:
+                        chat_channel_id = config.get('chat_channel_id')
+                        if chat_channel_id:
+                            channel = guild.get_channel(chat_channel_id)
+                            if channel:
+                                self.logger.info(f"No leaderboard messages found for guild {guild_id}, creating...")
+                                await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                        continue
+                    
+                    channel = guild.get_channel(msg_data['channel_id'])
+                    if not channel:
+                        # Channel was deleted, clean up database reference
+                        self.logger.warning(f"Chat leaderboard channel {msg_data['channel_id']} not found for guild {guild_id}, cleaning up")
                         await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'chat'})
-                        await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                        continue
+                    
+                    # Get message IDs (support both old and new format)
+                    daily_id = msg_data.get('daily_message_id') or msg_data.get('message_id')
+                    weekly_id = msg_data.get('weekly_message_id')
+                    monthly_id = msg_data.get('monthly_message_id')
+                    
+                    messages_missing = False
+                    
+                    # Update all three messages
+                    try:
+                        # Update daily message
+                        if daily_id:
+                            try:
+                                daily_message = await channel.fetch_message(daily_id)
+                                if daily_message.author.id == self.bot.user.id:
+                                    daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
+                                    daily_view = LeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
+                                    await daily_message.edit(embed=daily_embed, view=daily_view)
+                                else:
+                                    messages_missing = True
+                            except discord.NotFound:
+                                messages_missing = True
+                        
+                        # Update weekly message
+                        if weekly_id:
+                            try:
+                                weekly_message = await channel.fetch_message(weekly_id)
+                                if weekly_message.author.id == self.bot.user.id:
+                                    weekly_embed = await self._build_period_embed(guild_id, 'weekly', page=0)
+                                    weekly_view = LeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
+                                    await weekly_message.edit(embed=weekly_embed, view=weekly_view)
+                                else:
+                                    messages_missing = True
+                            except discord.NotFound:
+                                messages_missing = True
+                        
+                        # Update monthly message
+                        if monthly_id:
+                            try:
+                                monthly_message = await channel.fetch_message(monthly_id)
+                                if monthly_message.author.id == self.bot.user.id:
+                                    monthly_embed = await self._build_period_embed(guild_id, 'monthly', page=0)
+                                    monthly_view = LeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
+                                    await monthly_message.edit(embed=monthly_embed, view=monthly_view)
+                                else:
+                                    messages_missing = True
+                            except discord.NotFound:
+                                messages_missing = True
+                        
+                        # If any messages are missing, recreate all
+                        if messages_missing or not all([daily_id, weekly_id, monthly_id]):
+                            self.logger.info(f"Chat leaderboard messages missing or invalid for guild {guild_id}, recreating")
+                            await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'chat'})
+                            await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                            
                     except discord.Forbidden as e:
-                        # This shouldn't happen after ownership check, but handle it anyway
                         self.logger.error(
                             f"Permission denied editing message for guild {guild_id}: {e}. "
                             f"Removing invalid reference and recreating."
@@ -507,7 +656,7 @@ class ChatLeaderboardCog(commands.Cog):
     async def before_update_leaderboards(self):
         await self.bot.wait_until_ready()
     
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=5)  # Check every 5 minutes for maximum reliability
     async def weekly_reset(self):
         """Check for weekly reset with missed reset detection
         
@@ -532,15 +681,31 @@ class ChatLeaderboardCog(commands.Cog):
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
                     
-                    # Check if it's reset time (Sunday 12 PM)
-                    if now.weekday() == 6 and now.hour == 12:
-                        # Check if already reset this week
-                        last_reset_time = config.get('last_chat_weekly_reset')
-                        if last_reset_time:
-                            days_since = (datetime.utcnow() - last_reset_time).days
-                            if days_since < 6:
-                                continue  # Already reset this week
+                    # Multiple checks to NEVER miss weekly reset
+                    last_reset_time = config.get('last_chat_weekly_reset')
+                    should_reset = False
+                    
+                    if last_reset_time:
+                        hours_since = (datetime.utcnow() - last_reset_time).total_seconds() / 3600
+                        days_since = hours_since / 24
                         
+                        # Check 1: Has it been at least 6.5 days?
+                        if days_since >= 6.5:
+                            if now.weekday() == 6 and now.hour >= 12:  # Sunday noon or later
+                                should_reset = True
+                                self.logger.info(f"Weekly reset for guild {guild_id}: {days_since:.1f} days since last")
+                            elif now.weekday() == 0:  # Monday (missed Sunday)
+                                should_reset = True
+                                self.logger.warning(f"Missed Sunday reset for guild {guild_id}, doing it now")
+                            elif days_since >= 7.0:  # Full week
+                                should_reset = True
+                                self.logger.warning(f"Full week passed for guild {guild_id}: {days_since:.1f} days")
+                    else:
+                        # Never reset before - do it now
+                        should_reset = True
+                        self.logger.info(f"First weekly reset for guild {guild_id}")
+                    
+                    if should_reset:
                         await self._reset_weekly_stats(guild_id)
                         # Persist reset time to database
                         await self.db.guild_configs.update_one(
@@ -548,20 +713,6 @@ class ChatLeaderboardCog(commands.Cog):
                             {'$set': {'last_chat_weekly_reset': datetime.utcnow()}}
                         )
                         self.last_weekly_reset[guild_id] = now
-                    
-                    # Check for missed reset (if last reset was more than 8 days ago)
-                    else:
-                        last_reset_time = config.get('last_chat_weekly_reset')
-                        if last_reset_time:
-                            days_since = (datetime.utcnow() - last_reset_time).days
-                            if days_since > 8:  # Missed a reset
-                                self.logger.warning(f"Missed weekly reset detected for guild {guild_id}, executing now")
-                                await self._reset_weekly_stats(guild_id)
-                                await self.db.guild_configs.update_one(
-                                    {'guild_id': guild_id},
-                                    {'$set': {'last_chat_weekly_reset': datetime.utcnow()}}
-                                )
-                                self.last_weekly_reset[guild_id] = now
                 
                 except pytz.exceptions.UnknownTimeZoneError:
                     self.logger.error(f"Invalid timezone for guild {guild_id}: {tz_name}")
@@ -574,7 +725,7 @@ class ChatLeaderboardCog(commands.Cog):
     async def before_weekly_reset(self):
         await self.bot.wait_until_ready()
     
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=5)  # Check every 5 minutes
     async def daily_reset(self):
         """Check for daily reset (midnight guild time)"""
         try:
@@ -584,16 +735,38 @@ class ChatLeaderboardCog(commands.Cog):
                 guild_id = config['guild_id']
                 tz_name = config.get('timezone', 'UTC')
                 try:
+                    # Validate timezone
+                    if tz_name not in pytz.all_timezones:
+                        self.logger.warning(f"Invalid timezone '{tz_name}' for guild {guild_id}, using UTC")
+                        tz_name = 'UTC'
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
-                    if now.hour == 0:  # Midnight
-                        # Check if already reset today
-                        last_reset = self.last_daily_reset.get(guild_id)
-                        if last_reset and last_reset.date() == now.date():
-                            continue  # Already reset today
+                    # Check for daily reset - be very careful not to miss
+                    last_reset = self.last_daily_reset.get(guild_id)
+                    last_db_reset = config.get('last_chat_daily_reset')
+                    should_reset = False
+                    
+                    # Use database time as primary source
+                    if last_db_reset:
+                        hours_since = (datetime.utcnow() - last_db_reset).total_seconds() / 3600
+                        if hours_since >= 23:  # At least 23 hours passed
+                            if now.hour >= 0:  # Midnight or later
+                                should_reset = True
+                    elif last_reset:
+                        if last_reset.date() != now.date():
+                            should_reset = True
+                    else:
+                        should_reset = True  # Never reset before
+                    
+                    if should_reset:
                         
                         await self._reset_daily_stats(guild_id)
                         self.last_daily_reset[guild_id] = now
+                        # Also save to database for persistence
+                        await self.db.guild_configs.update_one(
+                            {'guild_id': guild_id},
+                            {'$set': {'last_chat_daily_reset': datetime.utcnow()}}
+                        )
                 except pytz.exceptions.UnknownTimeZoneError:
                     self.logger.error(f"Invalid timezone for guild {guild_id}: {tz_name}")
                 except Exception as e:
@@ -605,7 +778,7 @@ class ChatLeaderboardCog(commands.Cog):
     async def before_daily_reset(self):
         await self.bot.wait_until_ready()
     
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=5)  # Check every 5 minutes
     async def monthly_reset(self):
         """Check for monthly reset (1st of month midnight guild time)"""
         try:
@@ -617,14 +790,22 @@ class ChatLeaderboardCog(commands.Cog):
                 try:
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
-                    if now.day == 1 and now.hour == 0:  # 1st of month, midnight
-                        # Check if already reset this month
-                        last_reset = self.last_monthly_reset.get(guild_id)
-                        if last_reset and last_reset.month == now.month and last_reset.year == now.year:
-                            continue  # Already reset this month
+                    # Check for monthly reset window (1st of month, midnight to 1 AM)
+                    if now.day == 1 and 0 <= now.hour < 1:
+                        # Check if already reset this month (use database as source of truth)
+                        last_db_reset = config.get('last_chat_monthly_reset')
+                        if last_db_reset:
+                            last_reset_tz = last_db_reset.replace(tzinfo=pytz.UTC).astimezone(tz)
+                            if last_reset_tz.month == now.month and last_reset_tz.year == now.year:
+                                continue  # Already reset this month
                         
                         await self._reset_monthly_stats(guild_id)
                         self.last_monthly_reset[guild_id] = now
+                        # Persist to database for crash recovery
+                        await self.db.guild_configs.update_one(
+                            {'guild_id': guild_id},
+                            {'$set': {'last_chat_monthly_reset': datetime.utcnow()}}
+                        )
                 except Exception as e:
                     self.logger.error(f"Error checking monthly reset for guild {guild_id}: {e}", exc_info=True)
         except Exception as e:

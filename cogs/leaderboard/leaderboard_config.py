@@ -20,6 +20,9 @@ class Emojis:
     PIN = "<:ogs_pin:1428605997395480636>"
     HEARTSPARK = "<a:heartspark_ogs:1427918324066422834>"
     MIC = "<:ogs_mic:1429054112552452158>"  # For voice leaderboard
+    USER = "<a:original_Peek:1429151221939441776>"  # Custom user emoji - UPDATE THIS WITH YOUR EMOJI ID
+    TROPHY = "<:ogsstprize:1429349697817935962>"  # Trophy for champion
+    STAR = "<:ogs_starr:1429348961885360149>"  # Star for winner
     
     # Button emojis
     LEFT_BUTTON_ID = 1426488800875380818
@@ -70,13 +73,24 @@ class ChatTemplates:
     def build_description(period_title: str, total_messages: int, period_display: str,
                          top_user_name: str, top_user_count: int, 
                          leaderboard_text: str, reset_timestamp: int, 
-                         subtitle: str) -> str:
+                         subtitle: str, last_month_winner: str = None) -> str:
         """Build complete chat leaderboard description"""
+        
+        # Build last month winner section if provided
+        last_month_section = ""
+        if last_month_winner:
+            last_month_section = f"""
+{ChatTemplates.DIVIDER_LINE}
+
+**🏆 Last Month's Champion:**
+ {last_month_winner}
+"""
+        
         return f"""# {Emojis.GOL} {period_title} 
 ‎ 
 **{Emojis.MOON} Total Messages Tracked:** `{total_messages:,}`
 **{Emojis.TIME}  Period:** `{period_display}`
-
+{last_month_section}
 {ChatTemplates.DIVIDER_LINE}
 
 **{Emojis.CROW} Most active chatter is `{top_user_name}` {Emojis.ARROW}`{top_user_count:,} messages` **
@@ -130,15 +144,25 @@ class VoiceTemplates:
     def build_description(period_title: str, total_hours: int, period_display: str,
                          top_user_name: str, top_user_time: str, 
                          leaderboard_text: str, reset_timestamp: int, 
-                         subtitle: str, period: str) -> str:
+                         subtitle: str, period: str, last_month_winner: str = None) -> str:
         """Build complete voice leaderboard description"""
         top_message = VoiceTemplates.get_top_user_message(period)
+        
+        # Build last month winner section if provided
+        last_month_section = ""
+        if last_month_winner:
+            last_month_section = f"""
+{VoiceTemplates.DIVIDER_LINE}
+
+**🏆 Last Month's Champion:**
+ {last_month_winner}
+"""
         
         return f"""# {Emojis.MIC} {period_title} 
 ‎ 
 **{Emojis.MOON} Total Time Tracked:** `{total_hours:,} hours`
 **{Emojis.TIME}  Period:** `{period_display}`
-
+{last_month_section}
 {VoiceTemplates.DIVIDER_LINE}
 
 **{Emojis.CROW} Most active speaker is `{top_user_name}` {Emojis.ARROW}`{top_user_time}` **

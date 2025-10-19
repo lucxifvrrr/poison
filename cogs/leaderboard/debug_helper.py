@@ -1,0 +1,291 @@
+"""
+Debug Helper for Leaderboard System
+====================================
+Provides debugging utilities and data validation for tracking issues.
+"""
+
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+import discord
+from discord.ext import commands
+
+logger = logging.getLogger('discord.bot.leaderboard.debug')
+
+
+class DataTrackingValidator:
+    """Validate data tracking operations"""
+    
+    @staticmethod
+    async def validate_chat_increment(db, guild_id: int, user_id: int, before_stats: Dict = None) -> bool:
+        """
+        Validate that chat increment worked correctly.
+        Returns True if validation passes.
+        """
+        try:
+            # Get current stats
+            after_stats = await db.user_stats.find_one({
+                'guild_id': guild_id, 
+                'user_id': user_id
+            })
+            
+            if not after_stats:
+                logger.error(f"No stats found after increment for user {user_id} in guild {guild_id}")
+                return False
+            
+            if before_stats:
+                # Check all counters increased by 1
+                for field in ['chat_daily', 'chat_weekly', 'chat_monthly', 'chat_alltime']:
+                    before_val = before_stats.get(field, 0)
+                    after_val = after_stats.get(field, 0)
+                    if after_val != before_val + 1:
+                        logger.error(
+                            f"Chat increment failed for {field}: "
+                            f"before={before_val}, after={after_val}, expected={before_val + 1}"
+                        )
+                        return False
+            
+            logger.debug(f"Chat increment validated for user {user_id}: all counters increased correctly")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating chat increment: {e}")
+            return False
+    
+    @staticmethod
+    async def validate_voice_time(db, guild_id: int, user_id: int, 
+                                 minutes_added: float, before_stats: Dict = None) -> bool:
+        """
+        Validate that voice time was added correctly.
+        Returns True if validation passes.
+        """
+        try:
+            # Get current stats
+            after_stats = await db.user_stats.find_one({
+                'guild_id': guild_id,
+                'user_id': user_id
+            })
+            
+            if not after_stats:
+                logger.error(f"No stats found after voice time update for user {user_id}")
+                return False
+            
+            if before_stats:
+                # Check all voice counters increased by expected amount
+                for field in ['voice_daily', 'voice_weekly', 'voice_monthly', 'voice_alltime']:
+                    before_val = before_stats.get(field, 0)
+                    after_val = after_stats.get(field, 0)
+                    expected = before_val + minutes_added
+                    
+                    # Allow small tolerance for float precision
+                    if abs(after_val - expected) > 0.1:
+                        logger.error(
+                            f"Voice time increment failed for {field}: "
+                            f"before={before_val}, after={after_val}, "
+                            f"expected={expected}, added={minutes_added}"
+                        )
+                        return False
+            
+            logger.debug(f"Voice time validated for user {user_id}: {minutes_added:.2f} minutes added correctly")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating voice time: {e}")
+            return False
+    
+    @staticmethod
+    async def check_data_integrity(db, guild_id: int) -> Dict:
+        """
+        Check overall data integrity for a guild.
+        Returns a report of any issues found.
+        """
+        issues = []
+        
+        try:
+            # Check for negative values
+            negative_stats = await db.user_stats.find({
+                'guild_id': guild_id,
+                '$or': [
+                    {'chat_daily': {'$lt': 0}},
+                    {'chat_weekly': {'$lt': 0}},
+                    {'chat_monthly': {'$lt': 0}},
+                    {'voice_daily': {'$lt': 0}},
+                    {'voice_weekly': {'$lt': 0}},
+                    {'voice_monthly': {'$lt': 0}}
+                ]
+            }).to_list(length=100)
+            
+            if negative_stats:
+                issues.append(f"Found {len(negative_stats)} users with negative stats")
+                for stat in negative_stats[:5]:  # Show first 5
+                    issues.append(f"  User {stat['user_id']}: chat_daily={stat.get('chat_daily', 0)}, voice_daily={stat.get('voice_daily', 0)}")
+            
+            # Check for inconsistent values (daily > weekly or weekly > monthly)
+            inconsistent = await db.user_stats.find({
+                'guild_id': guild_id,
+                '$or': [
+                    {'$expr': {'$gt': ['$chat_daily', '$chat_weekly']}},
+                    {'$expr': {'$gt': ['$chat_weekly', '$chat_monthly']}},
+                    {'$expr': {'$gt': ['$voice_daily', '$voice_weekly']}},
+                    {'$expr': {'$gt': ['$voice_weekly', '$voice_monthly']}}
+                ]
+            }).to_list(length=100)
+            
+            if inconsistent:
+                issues.append(f"Found {len(inconsistent)} users with inconsistent time periods")
+            
+            # Check for extremely high values (possible corruption)
+            extreme_values = await db.user_stats.find({
+                'guild_id': guild_id,
+                '$or': [
+                    {'chat_daily': {'$gt': 10000}},
+                    {'voice_daily': {'$gt': 1440}}  # More than 24 hours in a day
+                ]
+            }).to_list(length=100)
+            
+            if extreme_values:
+                issues.append(f"Found {len(extreme_values)} users with extreme values")
+            
+            return {
+                'guild_id': guild_id,
+                'issues': issues,
+                'healthy': len(issues) == 0,
+                'timestamp': datetime.utcnow()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error checking data integrity: {e}")
+            return {
+                'guild_id': guild_id,
+                'issues': [f"Error during check: {e}"],
+                'healthy': False,
+                'timestamp': datetime.utcnow()
+            }
+
+
+class DebugCommands(commands.Cog):
+    """Debug commands for administrators"""
+    
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.db = None
+        self.logger = logging.getLogger('discord.bot.leaderboard.debug.commands')
+    
+    async def cog_load(self):
+        """Initialize database connection"""
+        if hasattr(self.bot, 'mongo_client') and self.bot.mongo_client:
+            self.db = self.bot.mongo_client['poison_bot']
+    
+    @commands.command(name='check_tracking')
+    @commands.has_permissions(administrator=True)
+    async def check_tracking(self, ctx: commands.Context):
+        """Check if data tracking is working correctly"""
+        if not self.db:
+            await ctx.send("❌ Database not connected")
+            return
+        
+        # Get before stats
+        before_stats = await self.db.user_stats.find_one({
+            'guild_id': ctx.guild.id,
+            'user_id': ctx.author.id
+        })
+        
+        # Send a test message to track
+        await ctx.send("📊 Testing tracking... Say something!")
+        
+        # Wait a bit
+        await asyncio.sleep(2)
+        
+        # Validate
+        validator = DataTrackingValidator()
+        chat_valid = await validator.validate_chat_increment(
+            self.db, ctx.guild.id, ctx.author.id, before_stats
+        )
+        
+        if chat_valid:
+            await ctx.send("✅ Chat tracking is working correctly!")
+        else:
+            await ctx.send("❌ Chat tracking has issues - check logs")
+    
+    @commands.command(name='check_integrity')
+    @commands.has_permissions(administrator=True)
+    async def check_integrity(self, ctx: commands.Context):
+        """Check data integrity for this guild"""
+        if not self.db:
+            await ctx.send("❌ Database not connected")
+            return
+        
+        await ctx.send("🔍 Checking data integrity...")
+        
+        validator = DataTrackingValidator()
+        report = await validator.check_data_integrity(self.db, ctx.guild.id)
+        
+        if report['healthy']:
+            await ctx.send("✅ **Data integrity check passed!** No issues found.")
+        else:
+            issues_text = "\n".join(report['issues'][:10])  # Show first 10 issues
+            await ctx.send(f"⚠️ **Data integrity issues found:**\n```\n{issues_text}\n```")
+    
+    @commands.command(name='force_star_now')
+    @commands.has_permissions(administrator=True)
+    async def force_star_now(self, ctx: commands.Context):
+        """Force Star of the Week selection immediately"""
+        # Find the star cog
+        star_cog = self.bot.get_cog('StarOfTheWeekCog')
+        if not star_cog:
+            await ctx.send("❌ Star of the Week cog not loaded")
+            return
+        
+        await ctx.send("⏳ Forcing Star of the Week selection...")
+        
+        try:
+            await star_cog._process_star_selection(ctx.guild)
+            await ctx.send("✅ Star of the Week selection completed!")
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
+    
+    @commands.command(name='reset_tracking')
+    @commands.has_permissions(administrator=True)
+    async def reset_tracking(self, ctx: commands.Context, period: str = "daily"):
+        """Reset tracking for a specific period (daily/weekly/monthly)"""
+        if not self.db:
+            await ctx.send("❌ Database not connected")
+            return
+        
+        if period not in ['daily', 'weekly', 'monthly']:
+            await ctx.send("❌ Period must be: daily, weekly, or monthly")
+            return
+        
+        # Confirmation
+        await ctx.send(f"⚠️ This will reset all {period} stats for this guild. Type 'confirm' to proceed.")
+        
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() == 'confirm'
+        
+        try:
+            await self.bot.wait_for('message', check=check, timeout=30.0)
+        except asyncio.TimeoutError:
+            await ctx.send("❌ Reset cancelled (timeout)")
+            return
+        
+        # Reset stats
+        update_fields = {
+            f'chat_{period}': 0,
+            f'voice_{period}': 0
+        }
+        
+        result = await self.db.user_stats.update_many(
+            {'guild_id': ctx.guild.id},
+            {'$set': update_fields}
+        )
+        
+        await ctx.send(f"✅ Reset {period} stats for {result.modified_count} users")
+
+
+# Import asyncio for sleep
+import asyncio
+
+
+async def setup(bot: commands.Bot):
+    """Load debug commands"""
+    await bot.add_cog(DebugCommands(bot))

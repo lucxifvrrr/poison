@@ -28,9 +28,10 @@ class VoiceLeaderboardPaginator(discord.ui.View):
         self.period = period
         self.page = page
         self.vibe_channel_id = vibe_channel_id
+        self.max_pages_cache = None  # Cache max pages
         
-        # Initialize the view without timeout
-        super().__init__(timeout=None)
+        # Initialize the view with timeout for memory management
+        super().__init__(timeout=300)  # 5 minutes timeout
         
         # Clear default buttons (they're added by decorators)
         self.clear_items()
@@ -102,12 +103,15 @@ class VoiceLeaderboardPaginator(discord.ui.View):
                 self.cog.logger.warning("Interaction already responded to in next_page")
                 return
             
-            stats = await self.cog._get_top_users(self.guild_id, self.period, limit=LeaderboardSettings.MAX_MEMBERS_FETCH)
-            if not stats:
-                await interaction.response.send_message("No data available!", ephemeral=True)
-                return
-            max_pages = max(0, (len(stats) - 1) // LeaderboardSettings.MEMBERS_PER_PAGE)
-            if self.page < max_pages:
+            # Use cached max_pages if available
+            if self.max_pages_cache is None:
+                stats = await self.cog._get_top_users(self.guild_id, self.period, limit=LeaderboardSettings.MAX_MEMBERS_FETCH)
+                if not stats:
+                    await interaction.response.send_message("No data available!", ephemeral=True)
+                    return
+                self.max_pages_cache = max(0, (len(stats) - 1) // LeaderboardSettings.MEMBERS_PER_PAGE)
+            
+            if self.page < self.max_pages_cache:
                 self.page += 1
                 # Update the embed for this period
                 new_embed = await self.cog._build_period_embed(self.guild_id, self.period, page=self.page)
@@ -134,6 +138,8 @@ class VoiceLeaderboardCog(commands.Cog):
         self.db = None
         self.voice_sessions = {}
         self.voice_sessions_lock = asyncio.Lock()  # Prevent race conditions
+        self.session_save_queue = {}  # Buffer for pending saves
+        self.max_session_duration = 10080  # Max 7 days in minutes
         self.last_daily_reset = {}  # {guild_id: datetime}
         self.last_weekly_reset = {}  # {guild_id: datetime}
         self.last_monthly_reset = {}  # {guild_id: datetime}
@@ -169,6 +175,7 @@ class VoiceLeaderboardCog(commands.Cog):
             self.weekly_reset.start()
             self.monthly_reset.start()
             self.save_voice_sessions_periodically.start()  # Periodic session saves
+            self.periodic_session_cleanup.start()  # Hourly cleanup
             self.logger.info("Voice leaderboard tasks started")
     
     async def cog_unload(self):
@@ -178,6 +185,7 @@ class VoiceLeaderboardCog(commands.Cog):
         self.weekly_reset.cancel()
         self.monthly_reset.cancel()
         self.save_voice_sessions_periodically.cancel()
+        self.periodic_session_cleanup.cancel()
         # Don't close shared MongoDB connection - it's managed by the bot
         # Only close if we created our own connection
         if self.mongo_client and not hasattr(self.bot, 'mongo_client'):
@@ -229,24 +237,44 @@ class VoiceLeaderboardCog(commands.Cog):
         self.logger.info(f"Initialized {len(self.voice_sessions)} active voice sessions")
     
     async def _save_all_voice_sessions(self):
-        """Save all active voice sessions to database before shutdown"""
+        """Save all active voice sessions to database before shutdown with memory cleanup"""
         if not self.voice_sessions:
             return
         
         async with self.voice_sessions_lock:
             saved_count = 0
-            for (guild_id, user_id), joined_at in list(self.voice_sessions.items()):
-                try:
-                    minutes = (datetime.utcnow() - joined_at).total_seconds() / 60
-                    if minutes > 0:
-                        await self._increment_voice_time(guild_id, user_id, minutes)
-                        saved_count += 1
-                except Exception as e:
-                    self.logger.error(f"Error saving voice session for user {user_id} in guild {guild_id}: {e}")
+            error_count = 0
+            sessions_to_save = list(self.voice_sessions.items())
             
+            # Process in batches to avoid overwhelming the database
+            batch_size = 50
+            for i in range(0, len(sessions_to_save), batch_size):
+                batch = sessions_to_save[i:i + batch_size]
+                for (guild_id, user_id), joined_at in batch:
+                    try:
+                        # Validate session data
+                        if not isinstance(joined_at, datetime):
+                            self.logger.warning(f"Invalid session data for user {user_id}: {joined_at}")
+                            continue
+                            
+                        minutes = (datetime.utcnow() - joined_at).total_seconds() / 60
+                        if minutes > 0:
+                            await self._increment_voice_time(guild_id, user_id, minutes)
+                            saved_count += 1
+                    except Exception as e:
+                        error_count += 1
+                        self.logger.error(f"Error saving voice session for user {user_id} in guild {guild_id}: {e}")
+                
+                # Small delay between batches
+                if i + batch_size < len(sessions_to_save):
+                    await asyncio.sleep(0.1)
+            
+            # Clear all sessions and save queue
             self.voice_sessions.clear()
-            if saved_count > 0:
-                self.logger.info(f"Saved {saved_count} active voice sessions before shutdown")
+            self.session_save_queue.clear()
+            
+            if saved_count > 0 or error_count > 0:
+                self.logger.info(f"Session save complete: {saved_count} saved, {error_count} errors")
     
     async def _create_indexes(self):
         """Create database indexes for voice leaderboard collections"""
@@ -268,9 +296,14 @@ class VoiceLeaderboardCog(commands.Cog):
             
             # Weekly history indexes for archives
             await self.db.weekly_history.create_index([('guild_id', 1), ('type', 1), ('period', 1), ('reset_date', -1)])
-            await self.db.weekly_history.create_index([('reset_date', 1)])
             
             # TTL index to auto-delete archives older than 1 year (31536000 seconds)
+            # Drop any conflicting old index first
+            try:
+                await self.db.weekly_history.drop_index('reset_date_1')
+            except:
+                pass  # Index doesn't exist, that's fine
+            
             await self.db.weekly_history.create_index(
                 [('reset_date', 1)],
                 expireAfterSeconds=31536000,
@@ -291,26 +324,47 @@ class VoiceLeaderboardCog(commands.Cog):
             await self.db.guild_configs.insert_one(config)
         return config
     
-    async def _increment_voice_time(self, guild_id: int, user_id: int, minutes: float):
-        """Increment voice time with validation and error handling"""
+    async def _increment_voice_time(self, guild_id: int, user_id: int, minutes: float, max_retries: int = 3):
+        """Increment voice time with validation, error handling, and retry logic"""
+        # Validate input
         if minutes <= 0:
+            self.logger.debug(f"Skipping voice increment for user {user_id}: minutes={minutes}")
             return
         
+        # Round to avoid float precision issues
+        minutes = round(minutes, 2)
+        
         # Validate minutes to prevent data corruption
-        if minutes > 10080:  # More than 7 days (clearly suspicious)
-            self.logger.warning(f"Suspicious voice time detected: {minutes} minutes for user {user_id} in guild {guild_id}. Capping at 10080 (7 days).")
-            minutes = 10080
+        if minutes > self.max_session_duration:
+            self.logger.warning(f"Suspicious voice time detected: {minutes} minutes for user {user_id} in guild {guild_id}. Capping at {self.max_session_duration}.")
+            minutes = self.max_session_duration
         elif minutes > 1440:  # 1-7 days (log but allow - some users stay in VC long-term)
             self.logger.info(f"Long voice session detected: {minutes:.1f} minutes ({minutes/60:.1f} hours) for user {user_id} in guild {guild_id}")
         
-        try:
-            await self.db.user_stats.update_one(
-                {'guild_id': guild_id, 'user_id': user_id},
-                {'$inc': {'voice_daily': minutes, 'voice_weekly': minutes, 'voice_monthly': minutes, 'voice_alltime': minutes}, '$set': {'last_update': datetime.utcnow()}},
-                upsert=True
-            )
-        except Exception as e:
-            self.logger.error(f"Error incrementing voice time for user {user_id} in guild {guild_id}: {e}")
+        # Retry logic for database operations
+        for attempt in range(max_retries):
+            try:
+                result = await self.db.user_stats.update_one(
+                    {'guild_id': guild_id, 'user_id': user_id},
+                    {
+                        '$inc': {
+                            'voice_daily': minutes, 
+                            'voice_weekly': minutes, 
+                            'voice_monthly': minutes, 
+                            'voice_alltime': minutes
+                        }, 
+                        '$set': {'last_update': datetime.utcnow()}
+                    },
+                    upsert=True
+                )
+                if result.acknowledged:
+                    return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+                    self.logger.warning(f"Retry {attempt + 1}/{max_retries} for voice increment: {e}")
+                else:
+                    self.logger.error(f"Failed to increment voice time after {max_retries} attempts for user {user_id} in guild {guild_id}: {e}")
     
     async def _get_top_users(self, guild_id: int, period: str, limit: int = 100) -> List[Dict]:
         """Get top users with error handling and validation"""
@@ -327,30 +381,92 @@ class VoiceLeaderboardCog(commands.Cog):
             self.logger.error(f"Error fetching top users for guild {guild_id}, period {period}: {e}")
             return []
     
+    async def _get_last_month_winner(self, guild_id: int) -> Optional[Dict]:
+        """Get last month's top active member from archive"""
+        try:
+            # Find the most recent monthly archive for this guild
+            cursor = self.db.weekly_history.find({
+                'guild_id': guild_id,
+                'type': 'voice',
+                'period': 'monthly'
+            }).sort('reset_date', -1).limit(1)
+            
+            archives = await cursor.to_list(length=1)
+            if not archives:
+                return None
+            
+            archive = archives[0]
+            stats = archive.get('stats', [])
+            
+            if not stats:
+                return None
+            
+            # Find the user with highest voice_monthly
+            top_user = max(stats, key=lambda x: x.get('voice_monthly', 0))
+            
+            if top_user.get('voice_monthly', 0) > 0:
+                return {
+                    'user_id': top_user['user_id'],
+                    'minutes': top_user['voice_monthly'],
+                    'month': archive['reset_date']
+                }
+            
+            return None
+        except Exception as e:
+            self.logger.error(f"Error fetching last month winner for guild {guild_id}: {e}")
+            return None
+    
     async def _get_leaderboard_message(self, guild_id: int) -> Optional[Dict]:
         return await self.db.leaderboard_messages.find_one({'guild_id': guild_id, 'type': 'voice'})
     
-    async def _save_leaderboard_message(self, guild_id: int, channel_id: int, message_id: int):
+    async def _save_leaderboard_messages(self, guild_id: int, channel_id: int, daily_id: int, weekly_id: int, monthly_id: int):
+        """Save all three leaderboard message IDs"""
         await self.db.leaderboard_messages.update_one(
             {'guild_id': guild_id, 'type': 'voice'},
-            {'$set': {'channel_id': channel_id, 'message_id': message_id, 'last_update': datetime.utcnow()}},
+            {'$set': {
+                'channel_id': channel_id,
+                'daily_message_id': daily_id,
+                'weekly_message_id': weekly_id,
+                'monthly_message_id': monthly_id,
+                'last_update': datetime.utcnow()
+            }},
+            upsert=True
+        )
+    
+    async def _save_leaderboard_message(self, guild_id: int, channel_id: int, message_id: int):
+        """Legacy method - kept for compatibility"""
+        await self.db.leaderboard_messages.update_one(
+            {'guild_id': guild_id, 'type': 'voice'},
+            {'$set': {'channel_id': channel_id, 'daily_message_id': message_id, 'last_update': datetime.utcnow()}},
             upsert=True
         )
     
     def _format_time(self, minutes: float) -> str:
-        """Format minutes into human-readable time string"""
-        # Validate input
+        """Format minutes into human-readable time string with validation"""
+        # Validate and sanitize input
+        if not isinstance(minutes, (int, float)):
+            self.logger.error(f"Invalid type for minutes: {type(minutes)}")
+            return "0m"
+        
         if minutes < 0:
             self.logger.warning(f"Negative time value received: {minutes}")
             minutes = 0
+        elif minutes > self.max_session_duration * 30:  # Sanity check for display
+            self.logger.warning(f"Extremely large time value: {minutes}")
+            minutes = self.max_session_duration * 30
+        
+        # Round to avoid float display issues
+        minutes = round(minutes)
         
         if minutes < 60:
-            return f"{int(minutes)}m"
-        hours = int(minutes // 60)
-        mins = int(minutes % 60)
+            return f"{minutes}m"
+        hours = minutes // 60
+        mins = minutes % 60
         if hours >= 24:
             days = hours // 24
             hours = hours % 24
+            if hours == 0:
+                return f"{days}d"
             return f"{days}d {hours}h"
         if mins == 0:
             return f"{hours} hours"
@@ -395,12 +511,16 @@ class VoiceLeaderboardCog(commands.Cog):
             if user:
                 username = user.display_name
             else:
-                # For users who left the server, show a shortened ID format
+                # For users who left the server, use consistent hash format
                 user_id_str = str(user_stat['user_id'])
-                username = f"User#{user_id_str[-4:]}"  # Show last 4 digits only
+                hash_char = chr(65 + (user_stat['user_id'] % 26))  # A-Z based on ID
+                username = f"User{hash_char}-{user_id_str[-6:]}"  # e.g., UserB-123456
             minutes = user_stat.get(f'voice_{period}', 0)
             time_str = self._format_time(minutes)
-            leaderboard_lines.append(f"- `{idx:02d}` | `{username}` {Emojis.ARROW} `{time_str}`")
+            # Truncate long usernames
+            if len(username) > 20:
+                username = username[:17] + "..."
+            leaderboard_lines.append(f"- `{idx:02d}` | {Emojis.USER} `{username}` {Emojis.ARROW} `{time_str}`")
         
         leaderboard_text = "\n".join(leaderboard_lines) if leaderboard_lines else "No data yet"
         
@@ -412,9 +532,13 @@ class VoiceLeaderboardCog(commands.Cog):
             if top_user:
                 top_user_name = top_user.display_name
             else:
-                # For users who left the server, show a shortened ID format
+                # For users who left the server, use consistent hash format
                 user_id_str = str(stats[0]['user_id'])
-                top_user_name = f"User#{user_id_str[-4:]}"  # Show last 4 digits only
+                hash_char = chr(65 + (stats[0]['user_id'] % 26))
+                top_user_name = f"User{hash_char}-{user_id_str[-6:]}"
+            # Truncate long names
+            if len(top_user_name) > 20:
+                top_user_name = top_user_name[:17] + "..."
             top_user_minutes = stats[0].get(f'voice_{period}', 0)
             top_user_time = self._format_time(top_user_minutes)
         
@@ -448,6 +572,33 @@ class VoiceLeaderboardCog(commands.Cog):
         
         reset_timestamp = int(next_reset.timestamp())
         
+        # Get last month's winner for monthly embeds
+        last_month_winner_text = None
+        if period == 'monthly':
+            last_month_data = await self._get_last_month_winner(guild_id)
+            if last_month_data:
+                winner_member = guild.get_member(last_month_data['user_id'])
+                if winner_member:
+                    winner_name = winner_member.display_name
+                else:
+                    # User left, use hash format
+                    user_id_str = str(last_month_data['user_id'])
+                    hash_char = chr(65 + (last_month_data['user_id'] % 26))
+                    winner_name = f"User{hash_char}-{user_id_str[-6:]}"
+                
+                # Format time
+                minutes = last_month_data['minutes']
+                if minutes >= 60:
+                    hours = int(minutes // 60)
+                    mins = int(minutes % 60)
+                    time_str = f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+                else:
+                    time_str = f"{int(minutes)}m"
+                
+                # Format the month name
+                month_name = last_month_data['month'].strftime('%B %Y')
+                last_month_winner_text = f"`{winner_name}` with `{time_str}` in {month_name}"
+        
         # Build description using config template
         description = VoiceTemplates.build_description(
             period_title=period_title,
@@ -458,7 +609,8 @@ class VoiceLeaderboardCog(commands.Cog):
             leaderboard_text=leaderboard_text,
             reset_timestamp=reset_timestamp,
             subtitle=subtitle,
-            period=period
+            period=period,
+            last_month_winner=last_month_winner_text
         )
         
         # Create embed
@@ -487,79 +639,98 @@ class VoiceLeaderboardCog(commands.Cog):
             # Send monthly embed with Join the Vibe button
             monthly_embed = await self._build_period_embed(guild_id, 'monthly', page=0)
             monthly_view = VoiceLeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
-            await channel.send(embed=monthly_embed, view=monthly_view)
+            monthly_message = await channel.send(embed=monthly_embed, view=monthly_view)
             
             # Send weekly embed with Join the Vibe button
             weekly_embed = await self._build_period_embed(guild_id, 'weekly', page=0)
             weekly_view = VoiceLeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
-            await channel.send(embed=weekly_embed, view=weekly_view)
+            weekly_message = await channel.send(embed=weekly_embed, view=weekly_view)
             
             # Send daily embed with pagination buttons
             daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
             daily_view = VoiceLeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
             daily_message = await channel.send(embed=daily_embed, view=daily_view)
             
-            # Save the daily message ID for updates
-            await self._save_leaderboard_message(guild_id, channel.id, daily_message.id)
+            # Save ALL message IDs for updates
+            await self._save_leaderboard_messages(guild_id, channel.id, daily_message.id, weekly_message.id, monthly_message.id)
             self.logger.info(f"Created voice leaderboard messages for guild {guild_id}")
         except Exception as e:
             self.logger.error(f"Failed to create leaderboard for guild {guild_id}: {e}", exc_info=True)
     
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-        """Track voice activity with improved race condition handling"""
+        """Track voice activity with improved race condition handling and memory management"""
+        # Filter bots immediately
         if member.bot:
             return
         
-        config = await self._get_guild_config(member.guild.id)
-        if not config or not config.get('voice_enabled'):
-            return
-        
-        guild_id = member.guild.id
-        user_id = member.id
-        session_key = (guild_id, user_id)
-        current_time = datetime.utcnow()
-        
-        # Determine if channels are AFK
-        afk_channel_id = member.guild.afk_channel.id if member.guild.afk_channel else None
-        before_is_afk = before.channel and afk_channel_id and before.channel.id == afk_channel_id
-        after_is_afk = after.channel and afk_channel_id and after.channel.id == afk_channel_id
-        
-        async with self.voice_sessions_lock:
-            # User joined a voice channel (not AFK)
-            if before.channel is None and after.channel is not None and not after_is_afk:
-                self.voice_sessions[session_key] = current_time
-                self.logger.debug(f"Voice session started: {member.display_name} in guild {guild_id}")
+        try:
+            config = await self._get_guild_config(member.guild.id)
+            if not config or not config.get('voice_enabled'):
+                return
             
-            # User left a voice channel (not from AFK)
-            elif before.channel is not None and after.channel is None and not before_is_afk:
-                if session_key in self.voice_sessions:
-                    joined_at = self.voice_sessions.pop(session_key)
-                    minutes = (current_time - joined_at).total_seconds() / 60
-                    if minutes > 0:  # Ensure positive time
-                        await self._increment_voice_time(guild_id, user_id, minutes)
-                        self.logger.debug(f"Voice session ended: {member.display_name} - {minutes:.2f} minutes")
+            guild_id = member.guild.id
+            user_id = member.id
+            session_key = (guild_id, user_id)
+            current_time = datetime.utcnow()
             
-            # User moved between channels
-            elif before.channel != after.channel and before.channel is not None and after.channel is not None:
-                # Moving to AFK from active channel
-                if not before_is_afk and after_is_afk:
-                    if session_key in self.voice_sessions:
-                        joined_at = self.voice_sessions.pop(session_key)
-                        minutes = (current_time - joined_at).total_seconds() / 60
-                        if minutes > 0:
-                            await self._increment_voice_time(guild_id, user_id, minutes)
-                            self.logger.debug(f"Moved to AFK: {member.display_name} - {minutes:.2f} minutes")
-                
-                # Moving from AFK to active channel
-                elif before_is_afk and not after_is_afk:
+            # Clean up old sessions periodically (memory leak prevention)
+            if len(self.voice_sessions) > 1000:
+                await self._cleanup_stale_sessions()
+            
+            # Determine if channels are AFK
+            afk_channel_id = member.guild.afk_channel.id if member.guild.afk_channel else None
+            before_is_afk = before.channel and afk_channel_id and before.channel.id == afk_channel_id
+            after_is_afk = after.channel and afk_channel_id and after.channel.id == afk_channel_id
+            
+            async with self.voice_sessions_lock:
+                # User joined a voice channel (not AFK)
+                if before.channel is None and after.channel is not None and not after_is_afk:
                     self.voice_sessions[session_key] = current_time
-                    self.logger.debug(f"Moved from AFK: {member.display_name}")
+                    self.logger.debug(f"Voice session started: {member.display_name} in guild {guild_id}")
                 
-                # Moving between active channels (keep session alive)
-                elif not before_is_afk and not after_is_afk:
-                    # Session continues, no action needed
-                    pass
+                # User left a voice channel (not from AFK)
+                elif before.channel is not None and after.channel is None and not before_is_afk:
+                    if session_key in self.voice_sessions:
+                        joined_at = self.voice_sessions.pop(session_key, None)
+                        if joined_at and isinstance(joined_at, datetime):
+                            minutes = (current_time - joined_at).total_seconds() / 60
+                            if 0 < minutes < self.max_session_duration:  # Validate reasonable time
+                                # Queue the save instead of immediate write
+                                self.session_save_queue[session_key] = minutes
+                                # Process queue if it gets too large
+                                if len(self.session_save_queue) >= 10:
+                                    await self._process_save_queue()
+                            elif minutes >= self.max_session_duration:
+                                self.logger.warning(f"Session exceeded max duration for {member.display_name}: {minutes:.1f} minutes")
+                                await self._increment_voice_time(guild_id, user_id, self.max_session_duration)
+                
+                # User moved between channels
+                elif before.channel != after.channel and before.channel is not None and after.channel is not None:
+                    # Moving to AFK from active channel
+                    if not before_is_afk and after_is_afk:
+                        if session_key in self.voice_sessions:
+                            joined_at = self.voice_sessions.pop(session_key, None)
+                            if joined_at and isinstance(joined_at, datetime):
+                                minutes = (current_time - joined_at).total_seconds() / 60
+                                if 0 < minutes < self.max_session_duration:
+                                    self.session_save_queue[session_key] = minutes
+                                    if len(self.session_save_queue) >= 10:
+                                        await self._process_save_queue()
+                    
+                    # Moving from AFK to active channel
+                    elif before_is_afk and not after_is_afk:
+                        self.voice_sessions[session_key] = current_time
+                        self.logger.debug(f"Moved from AFK: {member.display_name}")
+                    
+                    # Moving between active channels (keep session alive)
+                    elif not before_is_afk and not after_is_afk:
+                        # Validate existing session
+                        if session_key not in self.voice_sessions:
+                            self.voice_sessions[session_key] = current_time
+                            self.logger.debug(f"Session missing, started new: {member.display_name}")
+        except Exception as e:
+            self.logger.error(f"Error in voice state update for {member.id}: {e}", exc_info=True)
     
     @tasks.loop(minutes=5)
     async def update_leaderboards(self):
@@ -573,46 +744,80 @@ class VoiceLeaderboardCog(commands.Cog):
                     continue
                 try:
                     msg_data = await self._get_leaderboard_message(guild_id)
-                    if not msg_data:
-                        continue
-                    channel = guild.get_channel(msg_data['channel_id'])
-                    if not channel:
-                        continue
-                    
-                    # Get vibe_channel_id from config
                     vibe_channel_id = config.get('vibe_channel_id')
                     
-                    try:
-                        # Only update the daily message (we store the daily message ID)
-                        message = await channel.fetch_message(msg_data['message_id'])
-                        
-                        # Verify the bot owns this message
-                        if message.author.id != self.bot.user.id:
-                            self.logger.warning(
-                                f"Voice leaderboard message {msg_data['message_id']} in guild {guild_id} "
-                                f"is owned by {message.author} (ID: {message.author.id}), not this bot. "
-                                f"Removing invalid reference and recreating."
-                            )
-                            # Delete invalid reference from database
-                            await self.db.leaderboard_messages.delete_one({
-                                'guild_id': guild_id,
-                                'type': 'voice'
-                            })
-                            # Recreate leaderboard with correct bot ownership
-                            await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
-                            continue
-                        
-                        # Update the message
-                        daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
-                        daily_view = VoiceLeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
-                        await message.edit(embed=daily_embed, view=daily_view)
-                    except discord.NotFound:
-                        # If daily message not found, recreate all messages
-                        self.logger.info(f"Voice leaderboard message not found for guild {guild_id}, recreating")
+                    # If no message data exists, try to create messages if channel is configured
+                    if not msg_data:
+                        voice_channel_id = config.get('voice_channel_id')
+                        if voice_channel_id:
+                            channel = guild.get_channel(voice_channel_id)
+                            if channel:
+                                self.logger.info(f"No leaderboard messages found for guild {guild_id}, creating...")
+                                await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                        continue
+                    
+                    channel = guild.get_channel(msg_data['channel_id'])
+                    if not channel:
+                        # Channel was deleted, clean up database reference
+                        self.logger.warning(f"Voice leaderboard channel {msg_data['channel_id']} not found for guild {guild_id}, cleaning up")
                         await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'voice'})
-                        await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                        continue
+                    
+                    # Get message IDs (support both old and new format)
+                    daily_id = msg_data.get('daily_message_id') or msg_data.get('message_id')
+                    weekly_id = msg_data.get('weekly_message_id')
+                    monthly_id = msg_data.get('monthly_message_id')
+                    
+                    messages_missing = False
+                    
+                    # Update all three messages
+                    try:
+                        # Update daily message
+                        if daily_id:
+                            try:
+                                daily_message = await channel.fetch_message(daily_id)
+                                if daily_message.author.id == self.bot.user.id:
+                                    daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
+                                    daily_view = VoiceLeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
+                                    await daily_message.edit(embed=daily_embed, view=daily_view)
+                                else:
+                                    messages_missing = True
+                            except discord.NotFound:
+                                messages_missing = True
+                        
+                        # Update weekly message
+                        if weekly_id:
+                            try:
+                                weekly_message = await channel.fetch_message(weekly_id)
+                                if weekly_message.author.id == self.bot.user.id:
+                                    weekly_embed = await self._build_period_embed(guild_id, 'weekly', page=0)
+                                    weekly_view = VoiceLeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
+                                    await weekly_message.edit(embed=weekly_embed, view=weekly_view)
+                                else:
+                                    messages_missing = True
+                            except discord.NotFound:
+                                messages_missing = True
+                        
+                        # Update monthly message
+                        if monthly_id:
+                            try:
+                                monthly_message = await channel.fetch_message(monthly_id)
+                                if monthly_message.author.id == self.bot.user.id:
+                                    monthly_embed = await self._build_period_embed(guild_id, 'monthly', page=0)
+                                    monthly_view = VoiceLeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
+                                    await monthly_message.edit(embed=monthly_embed, view=monthly_view)
+                                else:
+                                    messages_missing = True
+                            except discord.NotFound:
+                                messages_missing = True
+                        
+                        # If any messages are missing, recreate all
+                        if messages_missing or not all([daily_id, weekly_id, monthly_id]):
+                            self.logger.info(f"Voice leaderboard messages missing or invalid for guild {guild_id}, recreating")
+                            await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'voice'})
+                            await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                            
                     except discord.Forbidden as e:
-                        # This shouldn't happen after ownership check, but handle it anyway
                         self.logger.error(
                             f"Permission denied editing message for guild {guild_id}: {e}. "
                             f"Removing invalid reference and recreating."
@@ -632,7 +837,7 @@ class VoiceLeaderboardCog(commands.Cog):
         # Initialize voice sessions after bot is ready
         await self._initialize_voice_sessions()
     
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=5)  # Check every 5 minutes for zero chance of missing
     async def weekly_reset(self):
         """Check for weekly reset with missed reset detection
         
@@ -654,18 +859,39 @@ class VoiceLeaderboardCog(commands.Cog):
                 
                 tz_name = config.get('timezone', 'UTC')
                 try:
+                    # Validate timezone
+                    if tz_name not in pytz.all_timezones:
+                        self.logger.warning(f"Invalid timezone '{tz_name}' for guild {guild_id}, using UTC")
+                        tz_name = 'UTC'
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
                     
-                    # Check if it's reset time (Sunday 12 PM)
-                    if now.weekday() == 6 and now.hour == 12:
-                        # Check if already reset this week
-                        last_reset_time = config.get('last_voice_weekly_reset')
-                        if last_reset_time:
-                            days_since = (datetime.utcnow() - last_reset_time).days
-                            if days_since < 6:
-                                continue  # Already reset this week
+                    # Multiple checks to NEVER miss weekly reset
+                    last_reset_time = config.get('last_voice_weekly_reset')
+                    should_reset = False
+                    
+                    if last_reset_time:
+                        hours_since = (datetime.utcnow() - last_reset_time).total_seconds() / 3600
+                        days_since = hours_since / 24
                         
+                        # Check 1: Has it been at least 6.5 days?
+                        if days_since >= 6.5:
+                            if now.weekday() == 6 and now.hour >= 12:  # Sunday noon or later
+                                should_reset = True
+                                self.logger.info(f"Voice weekly reset for guild {guild_id}: {days_since:.1f} days since last")
+                            elif now.weekday() == 0:  # Monday (missed Sunday)
+                                should_reset = True
+                                self.logger.warning(f"Missed Sunday voice reset for guild {guild_id}, doing it now")
+                            elif days_since >= 7.0:  # Full week passed
+                                should_reset = True
+                                self.logger.warning(f"Full week passed for voice guild {guild_id}: {days_since:.1f} days")
+                    else:
+                        # Never reset before - do it now if enabled
+                        if config.get('voice_enabled'):
+                            should_reset = True
+                            self.logger.info(f"First voice weekly reset for guild {guild_id}")
+                    
+                    if should_reset:
                         await self._reset_weekly_stats(guild_id)
                         # Persist reset time to database
                         await self.db.guild_configs.update_one(
@@ -673,20 +899,6 @@ class VoiceLeaderboardCog(commands.Cog):
                             {'$set': {'last_voice_weekly_reset': datetime.utcnow()}}
                         )
                         self.last_weekly_reset[guild_id] = now
-                    
-                    # Check for missed reset (if last reset was more than 8 days ago)
-                    else:
-                        last_reset_time = config.get('last_voice_weekly_reset')
-                        if last_reset_time:
-                            days_since = (datetime.utcnow() - last_reset_time).days
-                            if days_since > 8:  # Missed a reset
-                                self.logger.warning(f"Missed weekly reset detected for guild {guild_id}, executing now")
-                                await self._reset_weekly_stats(guild_id)
-                                await self.db.guild_configs.update_one(
-                                    {'guild_id': guild_id},
-                                    {'$set': {'last_voice_weekly_reset': datetime.utcnow()}}
-                                )
-                                self.last_weekly_reset[guild_id] = now
                 
                 except pytz.exceptions.UnknownTimeZoneError:
                     self.logger.error(f"Invalid timezone for guild {guild_id}: {tz_name}")
@@ -699,7 +911,7 @@ class VoiceLeaderboardCog(commands.Cog):
     async def before_weekly_reset(self):
         await self.bot.wait_until_ready()
     
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=5)  # Check every 5 minutes
     async def daily_reset(self):
         """Check for daily reset (midnight guild time)"""
         try:
@@ -709,9 +921,14 @@ class VoiceLeaderboardCog(commands.Cog):
                 guild_id = config['guild_id']
                 tz_name = config.get('timezone', 'UTC')
                 try:
+                    # Validate timezone
+                    if tz_name not in pytz.all_timezones:
+                        self.logger.warning(f"Invalid timezone '{tz_name}' for guild {guild_id}, using UTC")
+                        tz_name = 'UTC'
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
-                    if now.hour == 0:  # Midnight
+                    # Check for reset window (midnight to 1 AM)
+                    if 0 <= now.hour < 1:
                         # Check if already reset today
                         last_reset = self.last_daily_reset.get(guild_id)
                         if last_reset and last_reset.date() == now.date():
@@ -730,7 +947,7 @@ class VoiceLeaderboardCog(commands.Cog):
     async def before_daily_reset(self):
         await self.bot.wait_until_ready()
     
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=5)  # Check every 5 minutes
     async def monthly_reset(self):
         """Check for monthly reset (1st of month midnight guild time)"""
         try:
@@ -740,16 +957,28 @@ class VoiceLeaderboardCog(commands.Cog):
                 guild_id = config['guild_id']
                 tz_name = config.get('timezone', 'UTC')
                 try:
+                    # Validate timezone
+                    if tz_name not in pytz.all_timezones:
+                        self.logger.warning(f"Invalid timezone '{tz_name}' for guild {guild_id}, using UTC")
+                        tz_name = 'UTC'
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
-                    if now.day == 1 and now.hour == 0:  # 1st of month, midnight
-                        # Check if already reset this month
-                        last_reset = self.last_monthly_reset.get(guild_id)
-                        if last_reset and last_reset.month == now.month and last_reset.year == now.year:
-                            continue  # Already reset this month
+                    # Check for monthly reset window (1st of month, midnight to 1 AM)
+                    if now.day == 1 and 0 <= now.hour < 1:
+                        # Check if already reset this month (use database as source of truth)
+                        last_db_reset = config.get('last_voice_monthly_reset')
+                        if last_db_reset:
+                            last_reset_tz = last_db_reset.replace(tzinfo=pytz.UTC).astimezone(tz)
+                            if last_reset_tz.month == now.month and last_reset_tz.year == now.year:
+                                continue  # Already reset this month
                         
                         await self._reset_monthly_stats(guild_id)
                         self.last_monthly_reset[guild_id] = now
+                        # Persist to database for crash recovery
+                        await self.db.guild_configs.update_one(
+                            {'guild_id': guild_id},
+                            {'$set': {'last_voice_monthly_reset': datetime.utcnow()}}
+                        )
                 except Exception as e:
                     self.logger.error(f"Error checking monthly reset for guild {guild_id}: {e}", exc_info=True)
         except Exception as e:
@@ -759,6 +988,44 @@ class VoiceLeaderboardCog(commands.Cog):
     async def before_monthly_reset(self):
         await self.bot.wait_until_ready()
     
+    async def _cleanup_stale_sessions(self):
+        """Remove stale sessions to prevent memory leaks"""
+        try:
+            current_time = datetime.utcnow()
+            stale_sessions = []
+            
+            for session_key, joined_at in self.voice_sessions.items():
+                if isinstance(joined_at, datetime):
+                    duration = (current_time - joined_at).total_seconds() / 60
+                    # Remove sessions older than max duration
+                    if duration > self.max_session_duration:
+                        stale_sessions.append(session_key)
+            
+            for session_key in stale_sessions:
+                guild_id, user_id = session_key
+                joined_at = self.voice_sessions.pop(session_key, None)
+                if joined_at:
+                    # Save the max duration
+                    await self._increment_voice_time(guild_id, user_id, self.max_session_duration)
+                    self.logger.warning(f"Cleaned up stale session for user {user_id} in guild {guild_id}")
+        except Exception as e:
+            self.logger.error(f"Error cleaning up stale sessions: {e}")
+    
+    async def _process_save_queue(self):
+        """Process queued voice time saves"""
+        if not self.session_save_queue:
+            return
+        
+        try:
+            queue_copy = self.session_save_queue.copy()
+            self.session_save_queue.clear()
+            
+            for (guild_id, user_id), minutes in queue_copy.items():
+                await self._increment_voice_time(guild_id, user_id, minutes)
+                self.logger.debug(f"Processed queued save: {minutes:.2f} minutes for user {user_id}")
+        except Exception as e:
+            self.logger.error(f"Error processing save queue: {e}")
+    
     @tasks.loop(minutes=10)
     async def save_voice_sessions_periodically(self):
         """
@@ -766,35 +1033,71 @@ class VoiceLeaderboardCog(commands.Cog):
         Runs every 10 minutes to update ongoing sessions.
         """
         try:
+            # Process any pending saves first
+            await self._process_save_queue()
+            
             if not self.voice_sessions:
                 return
             
             async with self.voice_sessions_lock:
                 saved_count = 0
+                error_count = 0
                 current_time = datetime.utcnow()
+                sessions_to_update = []
                 
                 for (guild_id, user_id), joined_at in list(self.voice_sessions.items()):
                     try:
+                        if not isinstance(joined_at, datetime):
+                            self.logger.warning(f"Invalid session data for user {user_id}: {joined_at}")
+                            continue
+                        
                         # Calculate time since last save (or join)
                         minutes = (current_time - joined_at).total_seconds() / 60
                         
-                        if minutes > 0:
-                            # Save accumulated time
-                            await self._increment_voice_time(guild_id, user_id, minutes)
-                            # Reset session start time to now (so we don't double-count)
-                            self.voice_sessions[(guild_id, user_id)] = current_time
-                            saved_count += 1
+                        if minutes > 0 and minutes < self.max_session_duration:
+                            sessions_to_update.append(((guild_id, user_id), minutes))
+                        elif minutes >= self.max_session_duration:
+                            # Cap at max duration and remove session
+                            sessions_to_update.append(((guild_id, user_id), self.max_session_duration))
+                            del self.voice_sessions[(guild_id, user_id)]
+                            self.logger.warning(f"Capped long session at {self.max_session_duration} minutes for user {user_id}")
                     except Exception as e:
-                        self.logger.error(f"Error saving voice session for user {user_id} in guild {guild_id}: {e}")
+                        error_count += 1
+                        self.logger.error(f"Error processing session for user {user_id}: {e}")
                 
-                if saved_count > 0:
-                    self.logger.debug(f"Saved {saved_count} active voice sessions (periodic backup)")
+                # Save in batches
+                for (guild_id, user_id), minutes in sessions_to_update:
+                    await self._increment_voice_time(guild_id, user_id, minutes)
+                    # Reset session start time to now (so we don't double-count)
+                    if (guild_id, user_id) in self.voice_sessions:
+                        self.voice_sessions[(guild_id, user_id)] = current_time
+                    saved_count += 1
+                
+                if saved_count > 0 or error_count > 0:
+                    self.logger.debug(f"Periodic save: {saved_count} saved, {error_count} errors, {len(self.voice_sessions)} active")
         
         except Exception as e:
             self.logger.error(f"Error in save_voice_sessions_periodically task: {e}", exc_info=True)
     
     @save_voice_sessions_periodically.before_loop
-    async def before_save_voice_sessions(self):
+    async def before_save_voice_sessions_periodically(self):
+        await self.bot.wait_until_ready()
+    
+    @tasks.loop(hours=1)
+    async def periodic_session_cleanup(self):
+        """
+        Periodic cleanup of stale voice sessions.
+        Runs every hour to prevent memory leaks even in low-activity servers.
+        """
+        try:
+            if len(self.voice_sessions) > 0:
+                self.logger.debug(f"Running periodic session cleanup ({len(self.voice_sessions)} active sessions)")
+                await self._cleanup_stale_sessions()
+        except Exception as e:
+            self.logger.error(f"Error in periodic session cleanup: {e}", exc_info=True)
+    
+    @periodic_session_cleanup.before_loop
+    async def before_periodic_session_cleanup(self):
         await self.bot.wait_until_ready()
     
     async def _reset_daily_stats(self, guild_id: int):

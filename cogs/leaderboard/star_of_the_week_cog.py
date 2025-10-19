@@ -4,7 +4,7 @@ Star of the Week Cog
 Selects and announces the most active member each week based on combined chat + voice activity.
 
 Features:
-- Weekly selection every Sunday 11 AM (guild timezone) - runs BEFORE weekly reset
+- Weekly selection every Sunday 12 PM (noon, guild timezone) - runs WITH weekly reset
 - Combined scoring: chat messages + voice minutes
 - Configurable weights per guild
 - Auto role assignment/removal (removes from previous winner first)
@@ -44,6 +44,7 @@ from typing import Optional, Dict, List
 import pytz
 from dotenv import load_dotenv
 import logging
+from .state_manager import BulletproofStateManager, RecoveryManager
 
 load_dotenv()
 
@@ -58,6 +59,8 @@ class StarOfTheWeekCog(commands.Cog):
         self.bot = bot
         self.mongo_client = None
         self.db = None
+        self.state_manager = None
+        self.recovery_manager = None
         self.logger = logging.getLogger('discord.bot.star_of_the_week')
     
     async def cog_load(self):
@@ -80,8 +83,29 @@ class StarOfTheWeekCog(commands.Cog):
         # Create indexes for optimal performance
         await self._create_indexes()
         
-        # Start task AFTER database connection is established
-        self.weekly_star_selection.start()
+        # Initialize state manager
+        self.state_manager = BulletproofStateManager(self.db)
+        self.recovery_manager = RecoveryManager(self.db)
+        
+        # Start task if bot is already ready (e.g., during cog reload)
+        # Otherwise, on_ready event will start it
+        if self.bot.is_ready():
+            if not self.weekly_star_selection.is_running():
+                self.weekly_star_selection.start()
+                self.logger.info("Star of the Week task started (bot already ready)")
+            # Run recovery check on startup
+            await self.recovery_manager.run_startup_recovery(self.bot)
+    
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Start tasks when bot is ready to avoid deadlock during cog loading"""
+        if not self.weekly_star_selection.is_running():
+            self.weekly_star_selection.start()
+            self.logger.info("Star of the Week task started (on_ready event)")
+        
+        # Run recovery check to catch any missed selections
+        if self.recovery_manager:
+            await self.recovery_manager.run_startup_recovery(self.bot)
     
     async def cog_unload(self):
         """Cleanup on cog unload"""
@@ -212,7 +236,7 @@ class StarOfTheWeekCog(commands.Cog):
     def _calculate_score(self, chat_count: int, voice_minutes: float, 
                         weight_chat: float, weight_voice: float) -> float:
         """
-        Calculate combined activity score.
+        Calculate combined activity score with validation.
         
         Args:
             chat_count: Number of messages sent
@@ -223,7 +247,15 @@ class StarOfTheWeekCog(commands.Cog):
         Returns:
             Combined score
         """
-        return (chat_count * weight_chat) + (voice_minutes * weight_voice)
+        # Validate inputs to prevent negative scores
+        chat_count = max(0, chat_count)
+        voice_minutes = max(0.0, voice_minutes)
+        weight_chat = max(0.0, weight_chat)
+        weight_voice = max(0.0, weight_voice)
+        
+        # Calculate score with float precision
+        score = (chat_count * weight_chat) + (voice_minutes * weight_voice)
+        return round(score, 2)
     
     async def _select_star_of_week(self, guild_id: int) -> Optional[Dict]:
         """
@@ -537,7 +569,7 @@ class StarOfTheWeekCog(commands.Cog):
     def _create_winner_dm_embed(self, guild: discord.Guild, score: float, 
                                 chat_count: int, voice_minutes: float) -> discord.Embed:
         """
-        Create styled DM embed for the winner.
+        Create compact DM embed for the winner with custom emojis.
         
         Args:
             guild: Discord guild
@@ -549,27 +581,32 @@ class StarOfTheWeekCog(commands.Cog):
             Discord embed
         """
         # Format voice time
-        voice_hours = int(voice_minutes // 60)
-        voice_mins = int(voice_minutes % 60)
-        voice_str = f"{voice_hours}h {voice_mins}m" if voice_hours > 0 else f"{voice_mins}m"
+        if voice_minutes >= 60:
+            voice_hours = int(voice_minutes // 60)
+            voice_mins = int(voice_minutes % 60)
+            voice_str = f"{voice_hours}h {voice_mins}m" if voice_mins > 0 else f"{voice_hours}h"
+        else:
+            voice_str = f"{int(voice_minutes)}m"
         
+        # Create embed with custom emojis
         embed = discord.Embed(
-            title="⭐ You're the Star of the Week!",
+            title=f"{Emojis.STAR} Star of the Week!",
             description=(
-                f"Congratulations! You've been selected as **{guild.name}'s** "
-                f"Star of the Week for your outstanding activity!\n\n"
-                f"**🏆 Your Stats This Week:**\n"
-                f"💬 **Messages Sent:** `{chat_count:,}`\n"
-                f"🎤 **Voice Time:** `{voice_str}`\n"
-                f"📊 **Combined Score:** `{score:.1f}`\n\n"
-                f"Keep up the amazing work! 🌟"
+                f"Congrats! You're **{guild.name}'s** Star!\n\n"
+                f"{Emojis.MOON} **Messages:** `{chat_count:,}`\n"
+                f"{Emojis.MIC} **Voice:** `{voice_str}`\n"
+                f"{Emojis.TROPHY} **Score:** `{score:.0f}`\n\n"
+                f"{Emojis.HEARTSPARK} Keep being awesome!"
             ),
             color=0xFFD700,  # Gold color
             timestamp=datetime.utcnow()
         )
         
-        embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
-        embed.set_footer(text=f"{guild.name} • Star of the Week", icon_url=guild.icon.url if guild.icon else None)
+        # Only add thumbnail if guild has icon
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        
+        embed.set_footer(text=guild.name, icon_url=Images.FOOTER_ICON)
         
         return embed
     
@@ -593,21 +630,21 @@ class StarOfTheWeekCog(commands.Cog):
         voice_str = f"{voice_hours}h {voice_mins}m" if voice_hours > 0 else f"{voice_mins}m"
         
         embed = discord.Embed(
-            title="⭐ Star of the Week Announcement",
+            title=f"{Emojis.STAR} Star of the Week Announcement",
             description=(
-                f"🎉 Congratulations to {member.mention} for being this week's **Star of the Week**!\n\n"
-                f"**📈 Weekly Activity:**\n"
-                f"💬 Messages: `{chat_count:,}`\n"
-                f"🎤 Voice Time: `{voice_str}`\n"
-                f"🏆 Score: `{score:.1f}`\n\n"
-                f"Thank you for being such an active and valuable member of our community! 🌟"
+                f"{Emojis.HEARTSPARK} Congratulations to {member.mention} for being this week's **Star of the Week**!\n\n"
+                f"**{Emojis.STARS} Weekly Activity:**\n"
+                f"{Emojis.MOON} **Messages:** `{chat_count:,}`\n"
+                f"{Emojis.MIC} **Voice Time:** `{voice_str}`\n"
+                f"{Emojis.TROPHY} **Score:** `{score:.1f}`\n\n"
+                f"Thank you for being such an active and valuable member of our community! {Emojis.CROW}"
             ),
             color=0xFFD700,
             timestamp=datetime.utcnow()
         )
         
         embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text="Keep being awesome!", icon_url=member.guild.icon.url if member.guild.icon else None)
+        embed.set_footer(text="Keep being awesome!", icon_url=Images.FOOTER_ICON)
         
         return embed
     
@@ -631,7 +668,31 @@ class StarOfTheWeekCog(commands.Cog):
         # Send DM to winner
         try:
             dm_embed = self._create_winner_dm_embed(guild, score, chat_count, voice_minutes)
-            await member.send(embed=dm_embed)
+            
+            # Get vibe channel from guild config
+            guild_config = await self._get_guild_config(guild.id)
+            vibe_channel_id = guild_config.get('vibe_channel_id') if guild_config else None
+            
+            # Create button view if vibe channel exists
+            if vibe_channel_id:
+                vibe_channel = guild.get_channel(vibe_channel_id)
+                if vibe_channel:
+                    view = discord.ui.View()
+                    # Use same emoji as leaderboard embeds
+                    vibe_emoji = discord.PartialEmoji(name='original_Peek', id=1429151221939441776, animated=True)
+                    button = discord.ui.Button(
+                        style=discord.ButtonStyle.secondary,
+                        label="Join the Vibe",
+                        url=f"https://discord.com/channels/{guild.id}/{vibe_channel_id}",
+                        emoji=vibe_emoji
+                    )
+                    view.add_item(button)
+                    await member.send(embed=dm_embed, view=view)
+                else:
+                    await member.send(embed=dm_embed)
+            else:
+                await member.send(embed=dm_embed)
+            
             self.logger.info(f"Sent Star DM to {member.display_name} in guild {guild.id}")
         except discord.Forbidden:
             self.logger.warning(f"Cannot DM {member.display_name} (DMs disabled) in guild {guild.id}")
@@ -659,17 +720,20 @@ class StarOfTheWeekCog(commands.Cog):
     
     # ==================== BACKGROUND TASKS ====================
     
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=5)  # Check every 5 minutes for maximum reliability
     async def weekly_star_selection(self):
         """
-        Check for weekly Star selection (Sunday 11 AM guild time).
-        Runs every hour and checks if it's time to select.
-        Runs 1 hour BEFORE weekly reset to ensure stats are available.
+        Check for weekly Star selection (Sunday 12 PM / noon guild time).
+        Runs every 5 minutes to ensure selection happens at the right time.
+        Selection happens at noon, then weekly leaderboards are reset immediately after.
         """
         try:
             # Get all guilds with Star config
             cursor = self.db.star_configs.find({})
             configs = await cursor.to_list(length=1000)
+            
+            if not configs:
+                return
             
             for star_config in configs:
                 guild_id = star_config['guild_id']
@@ -684,32 +748,25 @@ class StarOfTheWeekCog(commands.Cog):
                 tz_name = guild_config.get('timezone', 'UTC') if guild_config else 'UTC'
                 
                 try:
+                    # Validate timezone
+                    if tz_name not in pytz.all_timezones:
+                        self.logger.warning(f"Invalid timezone '{tz_name}' for guild {guild_id}, using UTC")
+                        tz_name = 'UTC'
                     tz = pytz.timezone(tz_name)
                     now = datetime.now(tz)
                     
-                    # Check if it's Sunday 11 AM (runs BEFORE weekly reset at 12 PM)
-                    if now.weekday() == 6 and now.hour == 11:
-                        # Check if we already selected this week
-                        previous_winner = await self._get_previous_winner(guild_id)
-                        if previous_winner:
-                            # Check if selection was within last 6 days (avoid duplicate selections)
-                            time_since_last = datetime.utcnow() - previous_winner['awarded_at']
-                            if time_since_last < timedelta(days=6):
-                                self.logger.debug(f"Already selected Star this week for guild {guild_id}")
-                                continue
-                        
-                        # Select Star of the Week
-                        self.logger.info(f"Triggering Star of the Week selection for guild {guild_id}")
-                        await self._process_star_selection(guild)
+                    # Use the bulletproof state manager to check if selection should run
+                    should_run_selection = await self.state_manager.ensure_star_selection(
+                        guild_id, star_config, guild_config
+                    )
                     
-                    # Check for missed selection (if last selection was more than 8 days ago)
-                    else:
-                        previous_winner = await self._get_previous_winner(guild_id)
-                        if previous_winner:
-                            time_since_last = datetime.utcnow() - previous_winner['awarded_at']
-                            if time_since_last > timedelta(days=8):
-                                self.logger.warning(f"Missed Star selection detected for guild {guild_id}, executing now")
-                                await self._process_star_selection(guild)
+                    if should_run_selection:
+                        # Select Star of the Week
+                        self.logger.info(f"Triggering Star selection for guild {guild_id}")
+                        success = await self._process_star_selection(guild)
+                        if success:
+                            # Mark selection as complete in database
+                            await self.state_manager.mark_star_selection_complete(guild_id)
                 
                 except pytz.exceptions.UnknownTimeZoneError:
                     self.logger.error(f"Invalid timezone for guild {guild_id}: {tz_name}")
@@ -814,9 +871,11 @@ class StarOfTheWeekCog(commands.Cog):
                 f"User {winner['user_id']} with score {winner['score']:.1f}. "
                 f"Weekly leaderboards have been reset."
             )
+            return True  # Selection successful
         
         except Exception as e:
             self.logger.error(f"Error processing Star selection for {guild.name}: {e}", exc_info=True)
+            return False  # Selection failed
     
     # ==================== CONSOLIDATED SLASH COMMAND ====================
     
@@ -873,7 +932,7 @@ class StarOfTheWeekCog(commands.Cog):
                 f"📊 **Scoring Weights:**\n"
                 f"   • Chat messages: `{weight_chat}` point(s) each\n"
                 f"   • Voice minutes: `{weight_voice}` point(s) each\n\n"
-                f"🗓️ **Selection:** Every Sunday at 11 AM (guild timezone)\n"
+                f"🗓️ **Selection:** Every Sunday at 12 PM / noon (guild timezone)\n"
                 f"💡 **Tip:** Higher weights = more impact on score"
             )
             
@@ -987,6 +1046,39 @@ class StarOfTheWeekCog(commands.Cog):
             
             info.append(f"✅ Star system is configured")
             info.append(f"📊 Weights: Chat={weight_chat}, Voice={weight_voice}")
+            
+            # Check if task is running
+            if self.weekly_star_selection.is_running():
+                info.append("✅ Automatic selection task is running")
+                
+                # Calculate next selection time
+                guild_config = await self._get_guild_config(interaction.guild.id)
+                tz_name = guild_config.get('timezone', 'UTC') if guild_config else 'UTC'
+                try:
+                    # Validate timezone
+                    if tz_name not in pytz.all_timezones:
+                        self.logger.warning(f"Invalid timezone '{tz_name}' for guild {interaction.guild.id}, using UTC")
+                        tz_name = 'UTC'
+                    tz = pytz.timezone(tz_name)
+                    now = datetime.now(tz)
+                    
+                    # Find next Sunday 12 PM (noon)
+                    days_until_sunday = (6 - now.weekday()) % 7
+                    if days_until_sunday == 0 and now.hour >= 12:
+                        days_until_sunday = 7  # Next week
+                    
+                    next_selection = now.replace(hour=12, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
+                    next_selection_utc = next_selection.astimezone(pytz.UTC)
+                    next_timestamp = int(next_selection_utc.timestamp())
+                    
+                    info.append(f"📅 Next automatic selection: <t:{next_timestamp}:F> (<t:{next_timestamp}:R>)")
+                    info.append(f"🕐 Current server time: {now.strftime('%A %I:%M %p')} ({tz_name})")
+                except Exception as e:
+                    warnings.append(f"⚠️ Could not calculate next selection time: {e}")
+            else:
+                issues.append("❌ **CRITICAL:** Automatic selection task is NOT running!")
+                issues.append("   This means automatic selections won't happen.")
+                issues.append("   **Fix:** Restart the bot to start the task.")
             
             # Check role exists
             role = interaction.guild.get_role(role_id)
@@ -1152,6 +1244,129 @@ class StarOfTheWeekCog(commands.Cog):
                 ephemeral=True
             )
             self.logger.error(f"Force select error: {e}", exc_info=True)
+    
+    @star_group.command(name="status", description="[ADMIN] Check automatic selection task status")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def star_status(self, interaction: discord.Interaction):
+        """
+        Check the status of the automatic selection task and timing.
+        
+        Shows real-time information about when the next selection will happen.
+        """
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Check if star system is configured
+            star_config = await self._get_star_config(interaction.guild.id)
+            if not star_config:
+                await interaction.followup.send(
+                    "❌ Star of the Week not configured! Use `/star setup` first.",
+                    ephemeral=True
+                )
+                return
+            
+            # Get timezone
+            guild_config = await self._get_guild_config(interaction.guild.id)
+            tz_name = guild_config.get('timezone', 'UTC') if guild_config else 'UTC'
+            
+            try:
+                # Validate timezone
+                if tz_name not in pytz.all_timezones:
+                    self.logger.warning(f"Invalid timezone '{tz_name}' for guild {interaction.guild.id}, using UTC")
+                    tz_name = 'UTC'
+                tz = pytz.timezone(tz_name)
+                now = datetime.now(tz)
+                now_utc = datetime.utcnow()
+            except pytz.exceptions.UnknownTimeZoneError:
+                await interaction.followup.send(
+                    f"❌ Invalid timezone: {tz_name}",
+                    ephemeral=True
+                )
+                return
+            
+            # Build status message
+            status = "# 🔍 Star Selection Task Status\n\n"
+            
+            # Task running status
+            if self.weekly_star_selection.is_running():
+                status += "✅ **Task Status:** Running\n"
+                status += f"🔄 **Check Interval:** Every 1 hour\n"
+            else:
+                status += "❌ **Task Status:** NOT RUNNING\n"
+                status += "⚠️ **Action Required:** Restart the bot\n\n"
+                await interaction.followup.send(status, ephemeral=True)
+                return
+            
+            # Current time info
+            status += f"\n## ⏰ Current Time\n"
+            status += f"🌍 **Guild Timezone:** {tz_name}\n"
+            status += f"🕐 **Current Time:** {now.strftime('%A, %B %d, %Y at %I:%M:%S %p')}\n"
+            status += f"📅 **Weekday:** {now.strftime('%A')} (weekday={now.weekday()})\n"
+            status += f"🕒 **Hour:** {now.hour}\n"
+            status += f"⏱️ **UTC Time:** {now_utc.strftime('%I:%M:%S %p')}\n"
+            
+            # Selection trigger condition
+            status += f"\n## 🎯 Selection Trigger\n"
+            status += f"**Triggers when:** Sunday (weekday=6) at hour=11\n"
+            status += f"**Current state:** weekday={now.weekday()}, hour={now.hour}\n"
+            
+            if now.weekday() == 6 and now.hour == 11:
+                status += f"✅ **RIGHT NOW is selection time!**\n"
+                
+                # Check if already selected
+                previous_winner = await self._get_previous_winner(interaction.guild.id)
+                if previous_winner:
+                    time_since_last = datetime.utcnow() - previous_winner['awarded_at']
+                    if time_since_last < timedelta(days=6):
+                        status += f"⚠️ But already selected {time_since_last.days} days ago (skipping)\n"
+                    else:
+                        status += f"✅ Last selection was {time_since_last.days} days ago (will select)\n"
+                else:
+                    status += f"✅ No previous selection (will select)\n"
+            else:
+                # Calculate next selection
+                days_until_sunday = (6 - now.weekday()) % 7
+                if days_until_sunday == 0 and now.hour >= 11:
+                    days_until_sunday = 7
+                
+                next_selection = now.replace(hour=11, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
+                time_until = next_selection - now
+                hours_until = int(time_until.total_seconds() / 3600)
+                
+                next_selection_utc = next_selection.astimezone(pytz.UTC)
+                next_timestamp = int(next_selection_utc.timestamp())
+                
+                status += f"⏳ **Next selection:** <t:{next_timestamp}:F>\n"
+                status += f"⏰ **Time until:** {hours_until} hours ({time_until.days} days)\n"
+            
+            # Previous selection info
+            previous_winner = await self._get_previous_winner(interaction.guild.id)
+            if previous_winner:
+                last_timestamp = int(previous_winner['awarded_at'].timestamp())
+                time_since = datetime.utcnow() - previous_winner['awarded_at']
+                
+                status += f"\n## 📜 Last Selection\n"
+                status += f"🏆 **Winner:** <@{previous_winner['user_id']}>\n"
+                status += f"📅 **When:** <t:{last_timestamp}:F> (<t:{last_timestamp}:R>)\n"
+                status += f"⏱️ **Time since:** {time_since.days} days, {time_since.seconds // 3600} hours ago\n"
+            else:
+                status += f"\n## 📜 Last Selection\n"
+                status += f"ℹ️ No previous selection (first time)\n"
+            
+            # Debug info
+            status += f"\n## 🐛 Debug Info\n"
+            status += f"**Task loop count:** {self.weekly_star_selection.current_loop}\n"
+            status += f"**Task is being cancelled:** {self.weekly_star_selection.is_being_cancelled()}\n"
+            status += f"**Task failed:** {self.weekly_star_selection.failed()}\n"
+            
+            await interaction.followup.send(status, ephemeral=True)
+        
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Error checking status: {e}",
+                ephemeral=True
+            )
+            self.logger.error(f"Status check error: {e}", exc_info=True)
     
     @star_group.command(name="preview", description="Preview current week's top candidates")
     async def star_preview(self, interaction: discord.Interaction):

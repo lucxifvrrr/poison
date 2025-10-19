@@ -704,9 +704,8 @@ class DiscordBot(commands.Bot):
             'config.py', 
             '__init__.py', 
             'leaderboard_config.py',  # Config file, not a cog
-            'BUGFIXES.md',
-            'DEEP_ANALYSIS.md',
-            'CRITICAL_FIXES_APPLIED.md',
+            'utils.py',  # Utility module, not a cog
+            'state_manager.py',  # State management module, not a cog
             'README.md'
         }
         
