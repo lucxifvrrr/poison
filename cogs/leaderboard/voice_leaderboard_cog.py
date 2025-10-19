@@ -30,8 +30,8 @@ class VoiceLeaderboardPaginator(discord.ui.View):
         self.vibe_channel_id = vibe_channel_id
         self.max_pages_cache = None  # Cache max pages
         
-        # Initialize the view with timeout for memory management
-        super().__init__(timeout=300)  # 5 minutes timeout
+        # Initialize the view with no timeout for persistent buttons
+        super().__init__(timeout=None)  # Persistent buttons that don't expire
         
         # Clear default buttons (they're added by decorators)
         self.clear_items()
@@ -143,6 +143,7 @@ class VoiceLeaderboardCog(commands.Cog):
         self.last_daily_reset = {}  # {guild_id: datetime}
         self.last_weekly_reset = {}  # {guild_id: datetime}
         self.last_monthly_reset = {}  # {guild_id: datetime}
+        self.view_cache = {}  # {(guild_id, period): view_instance} - cache views to preserve state
         self.logger = logging.getLogger('discord.bot.voice_leaderboard')
     
     async def cog_load(self):
@@ -634,6 +635,12 @@ class VoiceLeaderboardCog(commands.Cog):
     async def _create_full_leaderboard_message(self, channel: discord.TextChannel, guild_id: int, vibe_channel_id: int = None):
         """Create separate leaderboard messages for each period with individual buttons"""
         try:
+            # Clear old cached views since we're creating new messages
+            for period in ['daily', 'weekly', 'monthly']:
+                cache_key = (guild_id, period)
+                if cache_key in self.view_cache:
+                    del self.view_cache[cache_key]
+            
             # Send header image
             header_embed = discord.Embed(color=EMBED_COLOR)
             header_embed.set_image(url=Images.VOICE_HEADER)
@@ -643,16 +650,19 @@ class VoiceLeaderboardCog(commands.Cog):
             monthly_embed = await self._build_period_embed(guild_id, 'monthly', page=0)
             monthly_view = VoiceLeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
             monthly_message = await channel.send(embed=monthly_embed, view=monthly_view)
+            self.view_cache[(guild_id, 'monthly')] = monthly_view
             
             # Send weekly embed with Join the Vibe button
             weekly_embed = await self._build_period_embed(guild_id, 'weekly', page=0)
             weekly_view = VoiceLeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
             weekly_message = await channel.send(embed=weekly_embed, view=weekly_view)
+            self.view_cache[(guild_id, 'weekly')] = weekly_view
             
             # Send daily embed with pagination buttons
             daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
             daily_view = VoiceLeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
             daily_message = await channel.send(embed=daily_embed, view=daily_view)
+            self.view_cache[(guild_id, 'daily')] = daily_view
             
             # Save ALL message IDs for updates
             await self._save_leaderboard_messages(guild_id, channel.id, daily_message.id, weekly_message.id, monthly_message.id)
@@ -771,6 +781,8 @@ class VoiceLeaderboardCog(commands.Cog):
                     weekly_id = msg_data.get('weekly_message_id')
                     monthly_id = msg_data.get('monthly_message_id')
                     
+                    self.logger.debug(f"Guild {guild_id} - Message IDs: daily={daily_id}, weekly={weekly_id}, monthly={monthly_id}")
+                    
                     messages_missing = False
                     
                     # Update all three messages
@@ -778,47 +790,95 @@ class VoiceLeaderboardCog(commands.Cog):
                         # Update daily message
                         if daily_id:
                             try:
+                                self.logger.debug(f"Fetching daily message {daily_id} for guild {guild_id}")
                                 daily_message = await channel.fetch_message(daily_id)
+                                self.logger.debug(f"Successfully fetched daily message {daily_id}")
                                 if daily_message.author.id == self.bot.user.id:
-                                    daily_embed = await self._build_period_embed(guild_id, 'daily', page=0)
-                                    daily_view = VoiceLeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
+                                    # Get or create cached view to preserve page state
+                                    cache_key = (guild_id, 'daily')
+                                    if cache_key not in self.view_cache:
+                                        self.view_cache[cache_key] = VoiceLeaderboardPaginator(self, guild_id, 'daily', page=0, vibe_channel_id=vibe_channel_id)
+                                    daily_view = self.view_cache[cache_key]
+                                    # Build embed with current page from cached view
+                                    daily_embed = await self._build_period_embed(guild_id, 'daily', page=daily_view.page)
                                     await daily_message.edit(embed=daily_embed, view=daily_view)
+                                    self.logger.debug(f"Updated daily voice leaderboard for guild {guild_id}")
                                 else:
+                                    self.logger.warning(f"Daily message {daily_id} not owned by bot for guild {guild_id}")
                                     messages_missing = True
                             except discord.NotFound:
+                                self.logger.warning(f"Daily message {daily_id} not found for guild {guild_id}")
                                 messages_missing = True
+                            except Exception as e:
+                                self.logger.error(f"Error updating daily message for guild {guild_id}: {e}")
+                                messages_missing = True
+                        else:
+                            self.logger.warning(f"No daily_id found for guild {guild_id}")
+                            messages_missing = True
                         
                         # Update weekly message
                         if weekly_id:
                             try:
+                                self.logger.debug(f"Fetching weekly message {weekly_id} for guild {guild_id}")
                                 weekly_message = await channel.fetch_message(weekly_id)
+                                self.logger.debug(f"Successfully fetched weekly message {weekly_id}")
                                 if weekly_message.author.id == self.bot.user.id:
+                                    # Get or create cached view
+                                    cache_key = (guild_id, 'weekly')
+                                    if cache_key not in self.view_cache:
+                                        self.view_cache[cache_key] = VoiceLeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
+                                    weekly_view = self.view_cache[cache_key]
                                     weekly_embed = await self._build_period_embed(guild_id, 'weekly', page=0)
-                                    weekly_view = VoiceLeaderboardPaginator(self, guild_id, 'weekly', page=0, vibe_channel_id=vibe_channel_id)
                                     await weekly_message.edit(embed=weekly_embed, view=weekly_view)
+                                    self.logger.debug(f"Updated weekly voice leaderboard for guild {guild_id}")
                                 else:
+                                    self.logger.warning(f"Weekly message {weekly_id} not owned by bot for guild {guild_id}")
                                     messages_missing = True
                             except discord.NotFound:
+                                self.logger.warning(f"Weekly message {weekly_id} not found for guild {guild_id}")
                                 messages_missing = True
+                            except Exception as e:
+                                self.logger.error(f"Error updating weekly message for guild {guild_id}: {e}")
+                                messages_missing = True
+                        else:
+                            self.logger.warning(f"No weekly_id found for guild {guild_id}")
+                            messages_missing = True
                         
                         # Update monthly message
                         if monthly_id:
                             try:
+                                self.logger.debug(f"Fetching monthly message {monthly_id} for guild {guild_id}")
                                 monthly_message = await channel.fetch_message(monthly_id)
+                                self.logger.debug(f"Successfully fetched monthly message {monthly_id}")
                                 if monthly_message.author.id == self.bot.user.id:
+                                    # Get or create cached view
+                                    cache_key = (guild_id, 'monthly')
+                                    if cache_key not in self.view_cache:
+                                        self.view_cache[cache_key] = VoiceLeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
+                                    monthly_view = self.view_cache[cache_key]
                                     monthly_embed = await self._build_period_embed(guild_id, 'monthly', page=0)
-                                    monthly_view = VoiceLeaderboardPaginator(self, guild_id, 'monthly', page=0, vibe_channel_id=vibe_channel_id)
                                     await monthly_message.edit(embed=monthly_embed, view=monthly_view)
+                                    self.logger.debug(f"Updated monthly voice leaderboard for guild {guild_id}")
                                 else:
+                                    self.logger.warning(f"Monthly message {monthly_id} not owned by bot for guild {guild_id}")
                                     messages_missing = True
                             except discord.NotFound:
+                                self.logger.warning(f"Monthly message {monthly_id} not found for guild {guild_id}")
                                 messages_missing = True
+                            except Exception as e:
+                                self.logger.error(f"Error updating monthly message for guild {guild_id}: {e}")
+                                messages_missing = True
+                        else:
+                            self.logger.warning(f"No monthly_id found for guild {guild_id}")
+                            messages_missing = True
                         
                         # If any messages are missing, recreate all
-                        if messages_missing or not all([daily_id, weekly_id, monthly_id]):
-                            self.logger.info(f"Voice leaderboard messages missing or invalid for guild {guild_id}, recreating")
+                        if messages_missing:
+                            self.logger.info(f"Voice leaderboard messages missing or invalid for guild {guild_id}, recreating all embeds")
                             await self.db.leaderboard_messages.delete_one({'guild_id': guild_id, 'type': 'voice'})
                             await self._create_full_leaderboard_message(channel, guild_id, vibe_channel_id)
+                        else:
+                            self.logger.info(f"Successfully updated all voice leaderboards for guild {guild_id}")
                             
                     except discord.Forbidden as e:
                         self.logger.error(

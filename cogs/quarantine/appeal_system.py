@@ -37,9 +37,9 @@ mongo = MongoClient(
     MONGO_URL,
     maxPoolSize=50,
     minPoolSize=10,
-    serverSelectionTimeoutMS=5000,
-    connectTimeoutMS=10000,
-    socketTimeoutMS=10000
+    serverSelectionTimeoutMS=10000,
+    connectTimeoutMS=20000,
+    socketTimeoutMS=60000
 )
 db = mongo.get_database("discord_mute_system")
 

@@ -110,6 +110,15 @@ class GiveawayAdminCog(commands.Cog):
     ):
         await interaction.response.defer(ephemeral=True)
         try:
+            # Validate message ID format
+            try:
+                int(message_id)
+            except ValueError:
+                return await interaction.followup.send(
+                    "❌ Invalid message ID format. Please provide a valid numeric message ID.",
+                    ephemeral=True
+                )
+            
             if not (MIN_FAKE_REACTIONS <= total_fake_reactions <= MAX_FAKE_REACTIONS):
                 raise ValueError(f"Total fake reactions must be {MIN_FAKE_REACTIONS}–{MAX_FAKE_REACTIONS}.")
             if not (MIN_FAKE_DURATION <= duration_in_minutes <= MAX_FAKE_DURATION):
@@ -281,7 +290,7 @@ class GiveawayAdminCog(commands.Cog):
                     embed = message.embeds[0]
                     prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
                     embed.description = (
-                        f"{WINNER_EMOJI} **Winner:** {gw['winners_count']}\n"
+                        f">>> {WINNER_EMOJI} **Winner:** {gw['winners_count']}\n"
                         f"{TIME_EMOJI} **Ends:** <t:{gw['end_time']}:R>\n"
                         f"{PRIZE_EMOJI} **Hosted by:** <@{gw['host_id']}>"
                     )
@@ -346,6 +355,15 @@ class GiveawayAdminCog(commands.Cog):
     ):
         await interaction.response.defer(ephemeral=True)
         try:
+            # Validate message ID format
+            try:
+                int(message_id)
+            except ValueError:
+                return await interaction.followup.send(
+                    "❌ Invalid message ID format. Please provide a valid numeric message ID.",
+                    ephemeral=True
+                )
+            
             giveaway_cog = self.bot.get_cog("GiveawayCog")
             if (
                 not giveaway_cog
@@ -457,6 +475,15 @@ class GiveawayAdminCog(commands.Cog):
         """Extend the duration of an active giveaway."""
         await interaction.response.defer(ephemeral=True)
         try:
+            # Validate message ID format
+            try:
+                int(message_id)
+            except ValueError:
+                return await interaction.followup.send(
+                    "❌ Invalid message ID format. Please provide a valid numeric message ID.",
+                    ephemeral=True
+                )
+            
             giveaway_cog = self.bot.get_cog("GiveawayCog")
             if (
                 not giveaway_cog
@@ -546,7 +573,7 @@ class GiveawayAdminCog(commands.Cog):
             embed = message.embeds[0]
             prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
             embed.description = (
-                f"{WINNER_EMOJI} **Winner:** {gw['winners_count']}\n"
+                f">>> {WINNER_EMOJI} **Winner:** {gw['winners_count']}\n"
                 f"{TIME_EMOJI} **Ends:** <t:{new_end_time}:R>\n"
                 f"{PRIZE_EMOJI} **Hosted by:** <@{gw['host_id']}>"
             )
@@ -571,17 +598,6 @@ class GiveawayAdminCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         message_id: str,
-        reason: Optional[str] = "Cancelled by administrator"
-    ):
-        """Cancel an active giveaway."""
-        await interaction.response.defer(ephemeral=True)
-        try:
-            giveaway_cog = self.bot.get_cog("GiveawayCog")
-            if (
-                not giveaway_cog
-                or not hasattr(giveaway_cog, "db")
-                or not giveaway_cog.db.connected
-            ):
                 return await interaction.followup.send(
                     "Giveaway system not available.", ephemeral=True
                 )
@@ -656,7 +672,6 @@ class GiveawayAdminCog(commands.Cog):
             if hasattr(giveaway_cog, '_cache_lock') and hasattr(giveaway_cog, '_participant_cache'):
                 async with giveaway_cog._cache_lock:
                     giveaway_cog._participant_cache.pop(message_id, None)
-                    giveaway_cog._last_update_counts.pop(message_id, None)
             
             await interaction.followup.send(
                 f"✅ Giveaway cancelled successfully.\nReason: {reason}",

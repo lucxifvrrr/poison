@@ -10,7 +10,12 @@ load_dotenv()
 
 # MongoDB connection setup using the environment variable
 MONGODB_URI = os.getenv('MONGO_URL')
-client = MongoClient(MONGODB_URI)  # Use the MongoDB URI from environment variable
+client = MongoClient(
+    MONGODB_URI,
+    serverSelectionTimeoutMS=10000,
+    connectTimeoutMS=20000,
+    socketTimeoutMS=60000
+)  # Use the MongoDB URI from environment variable
 db = client['dragmebot']  # Database name
 request_channels_collection = db['request_channels']  # Collection for storing request channels
 

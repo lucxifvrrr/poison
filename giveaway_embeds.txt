@@ -1,0 +1,258 @@
+============================================
+GIVEAWAY SYSTEM - ALL EMBED CODES
+============================================
+
+=============== 1. GIVEAWAY EDIT MENU EMBED (giveaway_core.py lines 738-770) ===============
+embed = discord.Embed(
+    title="🎉 Giveaway Management",
+    description="Select an action from the menu below:",
+    color=EMBED_COLOR
+)
+embed.add_field(
+    name="📊 Stats",
+    value="View giveaway statistics for this server",
+    inline=False
+)
+embed.add_field(
+    name="📈 Fill",
+    value="Gradually fill a giveaway with fake reactions",
+    inline=False
+)
+embed.add_field(
+    name="👑 Force Winner",
+    value="Force specific users to win a giveaway",
+    inline=False
+)
+embed.add_field(
+    name="⏰ Extend",
+    value="Extend or modify the duration of an active giveaway",
+    inline=False
+)
+embed.add_field(
+    name="❌ Cancel",
+    value="Cancel an active giveaway",
+    inline=False
+)
+
+
+=============== 2. GIVEAWAY ENTRIES - NO PARTICIPANTS EMBED (giveaway_core.py lines 310-316) ===============
+embed = discord.Embed(
+    title="📊 Giveaway Entries",
+    description="No participants found for this giveaway.",
+    color=EMBED_COLOR
+)
+embed.add_field(name="Prize", value=prize_name, inline=False)
+
+
+=============== 3. GIVEAWAY ENTRIES - WITH PARTICIPANTS EMBED (giveaway_core.py lines 325-342) ===============
+embed = discord.Embed(title="📊 Giveaway Entries", color=EMBED_COLOR)
+embed.add_field(name="Prize", value=prize_name, inline=False)
+
+text = ""
+for idx, part in enumerate(slice_participants, start=start + 1):
+    uid = part['id']
+    display = uid.split('_fake_')[0] if '_fake_' in uid else uid
+    try:
+        user = interaction.client.get_user(int(display))
+        if user:
+            text += f"`{idx:3d}.` **{user.display_name}** (@{user.name})\n"
+        else:
+            text += f"`{idx:3d}.` User ID: {display}\n"
+    except Exception:
+        text += f"`{idx:3d}.` User ID: {display}\n"
+
+embed.description = text
+embed.set_footer(text=f"Page {page+1} of {total_pages} | {total} total entries")
+
+
+=============== 4. GIVEAWAY START - ACTIVE EMBED (giveaway_core.py lines 1078-1093) ===============
+embed = discord.Embed(
+    title=f"{GIFT_EMOJI} {prize}",
+    description=(
+        f">>> {WINNER_EMOJI} **Winner:** {winners}\n"
+        f"{TIME_EMOJI} **Ends:** <t:{end_ts}:R>\n"
+        f"{PRIZE_EMOJI} **Hosted by:** {interaction.user.mention}"
+    ),
+    color=EMBED_COLOR,
+    timestamp=datetime.fromtimestamp(end_ts, timezone.utc)
+)
+thumbnail_url = get_thumbnail_url(interaction.guild)
+if thumbnail_url:
+    embed.set_thumbnail(url=thumbnail_url)
+
+if interaction.guild and interaction.guild.icon:
+    embed.set_footer(text="made with ♡", icon_url=str(interaction.guild.icon))
+
+
+=============== 5. GIVEAWAY END - ENDED EMBED (giveaway_core.py lines 1223-1238) ===============
+prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
+embed = discord.Embed(
+    title=f"{GIFT_EMOJI} {prize_name}",
+    description=(
+        f">>> {WINNER_EMOJI} **Winner:** {', '.join(mentions)}\n"
+        f"{TIME_EMOJI} **Ends:** <t:{now_ts}:R>\n"
+        f"{PRIZE_EMOJI} **Hosted by:** <@{gw['host_id']}>"
+    ),
+    color=EMBED_COLOR,
+    timestamp=datetime.fromtimestamp(now_ts, timezone.utc)
+)
+thumbnail_url = get_thumbnail_url(chan.guild)
+if thumbnail_url:
+    embed.set_thumbnail(url=thumbnail_url)
+
+if chan.guild and chan.guild.icon:
+    embed.set_footer(text="made with ♡", icon_url=str(chan.guild.icon))
+
+
+=============== 6. GIVEAWAY REROLL EMBED (giveaway_core.py lines 1336-1349) ===============
+prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
+embed = discord.Embed(
+    title=f"{GIFT_EMOJI} {prize_name}",
+    description=(
+        f">>> {WINNER_EMOJI} **Winner:** {', '.join(mentions)}\n"
+        f"{TIME_EMOJI} **Ends:** <t:{now_ts}:R>\n"
+        f"{PRIZE_EMOJI} **Hosted by:** <@{gw['host_id']}>"
+    ),
+    color=EMBED_COLOR,
+    timestamp=datetime.fromtimestamp(now_ts, timezone.utc)
+)
+thumbnail_url = get_thumbnail_url(ctx.guild)
+if thumbnail_url:
+    embed.set_thumbnail(url=thumbnail_url)
+embed.set_footer(icon_url=FOOTER_ICON_URL)
+
+
+=============== 7. GIVEAWAY STATISTICS EMBED (giveaway_core.py lines 1392-1428) ===============
+embed = discord.Embed(
+    title="📊 Giveaway Statistics",
+    color=EMBED_COLOR,
+    timestamp=get_utc_datetime()
+)
+
+embed.add_field(
+    name="Total Giveaways",
+    value=f"**{stats.get('total_giveaways', 0)}**",
+    inline=True
+)
+embed.add_field(
+    name="Active Giveaways",
+    value=f"**{len(active)}**",
+    inline=True
+)
+embed.add_field(
+    name="Total Winners",
+    value=f"**{stats.get('total_winners', 0)}**",
+    inline=True
+)
+embed.add_field(
+    name="Total Participants",
+    value=f"**{stats.get('total_participants', 0)}**",
+    inline=True
+)
+
+if stats.get('last_giveaway'):
+    embed.add_field(
+        name="Last Giveaway",
+        value=f"<t:{stats['last_giveaway']}:R>",
+        inline=True
+    )
+
+if interaction.guild.icon:
+    embed.set_thumbnail(url=interaction.guild.icon.url)
+
+
+=============== 8. GIVEAWAY START (PREFIX COMMAND) - ACTIVE EMBED (giveaway_core.py lines 1493-1508) ===============
+embed = discord.Embed(
+    title=f"{GIFT_EMOJI} {prize}",
+    description=(
+        f">>> {WINNER_EMOJI} **Winner:** {winners_text}\n"
+        f"{TIME_EMOJI} **Ends:** <t:{end_ts}:R>\n"
+        f"{PRIZE_EMOJI} **Hosted by:** {ctx.author.mention}"
+    ),
+    color=EMBED_COLOR,
+    timestamp=datetime.fromtimestamp(end_ts, timezone.utc)
+)
+thumbnail_url = get_thumbnail_url(ctx.guild)
+if thumbnail_url:
+    embed.set_thumbnail(url=thumbnail_url)
+
+if ctx.guild and ctx.guild.icon:
+    embed.set_footer(text="made with ♡", icon_url=str(ctx.guild.icon))
+
+
+=============== 9. GIVEAWAY CANCEL EMBED (giveaway_admin.py lines 639-651) ===============
+prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
+embed = discord.Embed(
+    title=f"{GIFT_EMOJI} {prize_name}",
+    description=(
+        f">>> {RED_DOT_EMOJI} **CANCELLED**\n"
+        f"{DOT_EMOJI} Reason: {reason}\n"
+        f"{DOT_EMOJI} Cancelled by: {interaction.user.mention}\n"
+        f"{DOT_EMOJI} Hosted by: <@{gw['host_id']}>"
+    ),
+    color=0xFF0000,  # Red color for cancelled
+    timestamp=datetime.fromtimestamp(now_ts, timezone.utc)
+)
+if icon:
+    embed.set_footer(text=channel.guild.name, icon_url=icon)
+
+
+=============== 10. GIVEAWAY EXTEND - UPDATED EMBED (giveaway_admin.py lines 546-554) ===============
+icon = None
+if channel.guild and hasattr(channel.guild, 'icon') and channel.guild.icon:
+    icon = channel.guild.icon.url
+embed = message.embeds[0]
+prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
+embed.description = (
+    f"{WINNER_EMOJI} **Winner:** {gw['winners_count']}\n"
+    f"{TIME_EMOJI} **Ends:** <t:{new_end_time}:R>\n"
+    f"{PRIZE_EMOJI} **Hosted by:** <@{gw['host_id']}>"
+)
+embed.timestamp = datetime.fromtimestamp(new_end_time, timezone.utc)
+embed.set_author(name=prize_name, icon_url=icon)
+
+
+=============== 11. FAKE REACTIONS - EMBED UPDATE (giveaway_admin.py lines 282-289) ===============
+if message.embeds:
+    embed = message.embeds[0]
+    prize_name = gw['prize'] if 'prize' in gw.keys() else 'Unknown'
+    embed.description = (
+        f"{WINNER_EMOJI} **Winner:** {gw['winners_count']}\n"
+        f"{TIME_EMOJI} **Ends:** <t:{gw['end_time']}:R>\n"
+        f"{PRIZE_EMOJI} **Hosted by:** <@{gw['host_id']}>"
+    )
+    embed.timestamp = datetime.fromtimestamp(gw["end_time"], timezone.utc)
+    await message.edit(embed=embed)
+
+
+============================================
+EMOJI CONSTANTS USED IN EMBEDS:
+============================================
+REACTION_EMOJI = "🎉"
+DOT_EMOJI = "<:sukoon_cdot:1324071922572996639>"
+RED_DOT_EMOJI = "<:ogs_reddot:1428638932887900270>"
+EMBED_COLOR = 0x2B2D31
+PRIZE_EMOJI = "<:ogs_gif:1428639542100885585>"
+WINNER_EMOJI = "<:ogs_crow:1428639113317453825>"
+TIME_EMOJI = "<:ogs_time:1428638675608141906>"
+GIFT_EMOJI = "🎁"
+GIVEAWAY_THUMBNAIL_URL = "https://images-ext-1.discordapp.net/external/7RBwotHDp9qC1T5jYqRrwYTE_QQk7jAsJTiYkJ5DAyo/https/i.postimg.cc/j5x98YMw/1f381.gif?width=640&height=640"
+FOOTER_ICON_URL = "https://media.discordapp.net/attachments/1428636041538965607/1428647953496539227/b8b7454ac714509f8c173209f79496a9-removebg-preview.png"
+
+
+============================================
+ANNOUNCEMENT MESSAGES (NOT EMBEDS):
+============================================
+1. Giveaway Start Announcement (line 1060 & 1489):
+   "**<:sukoon_taaada:1324071825910792223> GIVEAWAY <:sukoon_taaada:1324071825910792223>**"
+
+2. Winner Announcement (line 1276):
+   f"{REACTION_EMOJI} Congratulations {', '.join(mentions)}! You won **{gw['prize']}**!"
+
+3. Reroll Winner Announcement (line 1362):
+   f"{REACTION_EMOJI} Congratulations {', '.join(mentions)}! You won **{gw['prize']}**!"
+
+
+============================================
+END OF EMBED CODES
+============================================

@@ -39,6 +39,7 @@ except ImportError:
     PRIZE_EMOJI = "<:ogs_gif:1428639542100885585>"
     WINNER_EMOJI = "<:ogs_crow:1428639113317453825>"
     TIME_EMOJI = "<:ogs_time:1428638675608141906>"
+    GIFT_EMOJI = "<a:ogs_gift:1428659726790426686>"
     GIVEAWAY_THUMBNAIL_URL = "https://images-ext-1.discordapp.net/external/7RBwotHDp9qC1T5jYqRrwYTE_QQk7jAsJTiYkJ5DAyo/https/i.postimg.cc/j5x98YMw/1f381.gif?width=640&height=640"
     FOOTER_ICON_URL = "https://media.discordapp.net/attachments/1428636041538965607/1428647953496539227/b8b7454ac714509f8c173209f79496a9-removebg-preview.png"
 
@@ -140,35 +141,9 @@ class GiveawayJoinView(ui.View):
                     ephemeral=True
                 )
             
-            # Successfully joined - update button count immediately
-            if self.cog:
-                try:
-                    # Use single lock acquisition to prevent race conditions
-                    async with self.cog._cache_lock:
-                        # Get current count from cache (default to 0 if not exists)
-                        cached_count = self.cog._participant_cache.get(self.message_id, 0)
-                        
-                        # Increment count for immediate display
-                        new_count = cached_count + 1
-                        
-                        # Update cache atomically
-                        self.cog._participant_cache[self.message_id] = new_count
-                    
-                    # Update button label immediately
-                    for item in self.children:
-                        if isinstance(item, ui.Button) and item.custom_id == "view_entries":
-                            item.label = str(new_count)
-                            break
-                    
-                    # Schedule debounced message update to prevent rate limiting
-                    if interaction.message and self.cog:
-                        await self.cog._schedule_message_update(interaction.message, self)
-                except Exception as edit_error:
-                    logging.error(f"Error updating button count: {edit_error}")
-            
             # Send confirmation
             await interaction.followup.send(
-                f"🎉 You have successfully joined the giveaway!",
+                f"{REACTION_EMOJI} You have successfully joined the giveaway!",
                 ephemeral=True
             )
             
@@ -212,13 +187,6 @@ class GiveawayJoinView(ui.View):
                 if self.cog:
                     async with self.cog._cache_lock:
                         self.cog._participant_cache[self.message_id] = total
-            
-            # Update button label with current count
-            button.label = str(total)
-            
-            # Schedule debounced message update to prevent rate limiting
-            if interaction.message and self.cog:
-                await self.cog._schedule_message_update(interaction.message, self)
             
             # Show paginated entries list (same as ended giveaway) - using followup since already deferred
             view = EntriesView(self.message_id, self.db)
@@ -402,23 +370,30 @@ class GiveawayEndedView(ui.View):
         self.db = db_manager
         self.bot = bot
         
-        # Add buttons dynamically to show participant count in label
-        self.add_item(ui.Button(emoji=REACTION_EMOJI, style=ButtonStyle.gray, disabled=False, custom_id="giveaway_count", row=0))
-        self.add_item(ui.Button(label=str(participant_count), style=ButtonStyle.gray, custom_id="giveaway_entries", row=0))
+        # Set the correct label for entries button
+        self.entries_button.label = f"{participant_count}+ entries"
     
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Handle button interactions."""
+    @ui.button(emoji=REACTION_EMOJI, style=ButtonStyle.gray, custom_id="giveaway_ended_join", row=0)
+    async def join_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Show message that giveaway has ended."""
         try:
-            if interaction.data['custom_id'] == "giveaway_count":
-                await interaction.response.send_message(f"{REACTION_EMOJI} This giveaway had {self.participant_count} entries.", ephemeral=True)
-            elif interaction.data['custom_id'] == "giveaway_entries":
-                # Defer immediately before database operations
-                await interaction.response.defer(ephemeral=True)
-                view = EntriesView(self.message_id, self.db)
-                await view.show_entries_followup(interaction)
-            return True
+            await interaction.response.send_message(
+                "❌ This giveaway has ended. You can no longer join.",
+                ephemeral=True
+            )
         except Exception as e:
-            logging.error(f"Error in GiveawayEndedView interaction: {e}")
+            logging.error(f"Error in ended giveaway join button: {e}")
+    
+    @ui.button(label="0+ entries", style=ButtonStyle.gray, custom_id="giveaway_ended_entries", row=0)
+    async def entries_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Show entries list for ended giveaway."""
+        try:
+            # Defer immediately before database operations
+            await interaction.response.defer(ephemeral=True)
+            view = EntriesView(self.message_id, self.db)
+            await view.show_entries_followup(interaction)
+        except Exception as e:
+            logging.error(f"Error in GiveawayEndedView entries button: {e}")
             try:
                 if not interaction.response.is_done():
                     await interaction.response.send_message("An error occurred.", ephemeral=True)
@@ -426,7 +401,6 @@ class GiveawayEndedView(ui.View):
                     await interaction.followup.send("An error occurred.", ephemeral=True)
             except Exception:
                 pass
-            return False
 
 class GiveawayEditView(ui.View):
     """Interactive view for giveaway management."""
@@ -724,19 +698,13 @@ class GiveawayCog(commands.Cog):
         self._cache_lock = asyncio.Lock()
         self._user_cooldowns: Dict[str, float] = {}  # user_id -> last_action_time
         self._cooldown_duration = 2.0  # seconds between actions per user
-        self._last_update_counts: Dict[str, int] = {}  # message_id -> last_count to prevent unnecessary edits
-        
-        # Rate limit protection for message edits
-        self._pending_updates: Dict[str, asyncio.Task] = {}  # message_id -> update task
-        self._last_edit_time: Dict[str, float] = {}  # message_id -> timestamp of last edit
-        self._edit_cooldown = 3.0  # Minimum seconds between message edits
 
     @discord.app_commands.command(name="giveaway-edit", description="Edit and manage giveaways")
     @discord.app_commands.default_permissions(administrator=True)
     async def giveaway_edit_cmd(self, interaction: discord.Interaction):
         """Show interactive menu for giveaway management."""
         embed = discord.Embed(
-            title="🎉 Giveaway Management",
+            title=f"{REACTION_EMOJI} Giveaway Management",
             description="Select an action from the menu below:",
             color=EMBED_COLOR
         )
@@ -769,73 +737,14 @@ class GiveawayCog(commands.Cog):
         view = GiveawayEditView(self.bot)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    async def _schedule_message_update(self, message: discord.Message, view: ui.View):
-        """Schedule a debounced message update to prevent rate limiting."""
-        message_id = str(message.id)
-        
-        # Cancel any pending update for this message
-        if message_id in self._pending_updates:
-            task = self._pending_updates[message_id]
-            if not task.done():
-                task.cancel()
-        
-        # Schedule new update with delay
-        self._pending_updates[message_id] = asyncio.create_task(
-            self._debounced_message_update(message, view, message_id)
-        )
-    
-    async def _debounced_message_update(self, message: discord.Message, view: ui.View, message_id: str):
-        """Perform debounced message update with rate limit protection."""
-        try:
-            # Wait for debounce period (1 second to batch rapid updates)
-            await asyncio.sleep(1.0)
-            
-            # Check if enough time has passed since last edit
-            current_time = time.time()
-            if message_id in self._last_edit_time:
-                time_since_last = current_time - self._last_edit_time[message_id]
-                if time_since_last < self._edit_cooldown:
-                    # Wait for cooldown to expire
-                    await asyncio.sleep(self._edit_cooldown - time_since_last)
-            
-            # Perform the edit with retry on rate limit
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    await message.edit(view=view)
-                    self._last_edit_time[message_id] = time.time()
-                    break
-                except discord.HTTPException as e:
-                    if e.status == 429:  # Rate limited
-                        retry_after = float(e.response.headers.get('Retry-After', 5))
-                        logging.warning(f"Rate limited on message {message_id}, waiting {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        if attempt == max_retries - 1:
-                            logging.error(f"Failed to update message {message_id} after {max_retries} retries")
-                    else:
-                        logging.error(f"HTTP error updating message {message_id}: {e}")
-                        break
-                except Exception as e:
-                    logging.error(f"Error updating message {message_id}: {e}")
-                    break
-        except asyncio.CancelledError:
-            pass  # Task was cancelled, this is normal
-        except Exception as e:
-            logging.error(f"Unexpected error in debounced update for {message_id}: {e}")
-        finally:
-            # Clean up
-            if message_id in self._pending_updates:
-                del self._pending_updates[message_id]
-
     async def cog_load(self):
         await self.db.init()
         self.check_giveaways.start()
-        self.update_button_counts.start()
         self._ready.set()
         asyncio.create_task(self.register_persistent_views())
         
         # The command group is automatically registered when the cog loads
-        self.logger.info("[OK] GiveawayCog loaded with giveaway-edit command group")
+        self.logger.info("[OK] GiveawayCog loaded with reaction-based giveaway system")
 
     async def register_persistent_views(self):
         if not self.db.connected:
@@ -854,8 +763,8 @@ class GiveawayCog(commands.Cog):
                 mid = gw['message_id']
                 parts = await self.db.participants.find({"message_id": mid}).to_list(length=None)
                 bot_id = str(self.bot.user.id)
-                real = sum(1 for p in parts if p['user_id'] != bot_id and ('is_fake' not in p or p['is_fake'] == 0))
-                fake = sum(1 for p in parts if 'is_fake' in p and p['is_fake'] == 1)
+                real = sum(1 for p in parts if p['user_id'] != bot_id and p.get('is_fake', 0) == 0)
+                fake = sum(1 for p in parts if p.get('is_fake', 0) == 1)
                 total = real + fake
                 view = GiveawayEndedView(total, mid, self.db, self.bot)
                 self.bot.add_view(view, message_id=int(mid))
@@ -865,19 +774,108 @@ class GiveawayCog(commands.Cog):
 
     def cog_unload(self):
         self.check_giveaways.cancel()
-        self.update_button_counts.cancel()
         # Cancel all active fake reaction tasks
         for task in self.active_fake_reaction_tasks.values():
             if not task.done():
                 task.cancel()
         self.active_fake_reaction_tasks.clear()
-        # Cancel all pending message updates
-        for task in self._pending_updates.values():
-            if not task.done():
-                task.cancel()
-        self._pending_updates.clear()
         asyncio.create_task(self.db.close())
         self.logger.info("[INFO] GiveawayCog unloaded")
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Handle reaction adds for giveaway participation."""
+        # Ignore bot reactions
+        if payload.user_id == self.bot.user.id:
+            return
+        
+        # Check if reaction is the giveaway emoji
+        reaction_str = str(payload.emoji)
+        if reaction_str != REACTION_EMOJI:
+            return
+        
+        if not self.db.connected:
+            return
+        
+        try:
+            # Check if this message is an active giveaway
+            gw = await self.db.giveaways.find_one({
+                "message_id": str(payload.message_id),
+                "status": "active"
+            })
+            
+            if not gw:
+                return
+            
+            # Add user to participants
+            user_id = str(payload.user_id)
+            result = await self.db.participants.update_one(
+                {
+                    "message_id": str(payload.message_id),
+                    "user_id": user_id
+                },
+                {
+                    "$setOnInsert": {
+                        "message_id": str(payload.message_id),
+                        "user_id": user_id,
+                        "joined_at": get_current_utc_timestamp(),
+                        "is_forced": 0,
+                        "is_fake": 0,
+                        "original_user_id": None
+                    }
+                },
+                upsert=True
+            )
+            
+            # Update cache if new participant
+            if result.upserted_id:
+                async with self._cache_lock:
+                    current = self._participant_cache.get(str(payload.message_id), 0)
+                    self._participant_cache[str(payload.message_id)] = current + 1
+                    
+        except Exception as e:
+            self.logger.error(f"Error handling reaction add: {e}")
+    
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        """Handle reaction removes for giveaway participation."""
+        # Ignore bot reactions
+        if payload.user_id == self.bot.user.id:
+            return
+        
+        # Check if reaction is the giveaway emoji
+        reaction_str = str(payload.emoji)
+        if reaction_str != REACTION_EMOJI:
+            return
+        
+        if not self.db.connected:
+            return
+        
+        try:
+            # Check if this message is an active giveaway
+            gw = await self.db.giveaways.find_one({
+                "message_id": str(payload.message_id),
+                "status": "active"
+            })
+            
+            if not gw:
+                return
+            
+            # Remove user from participants
+            user_id = str(payload.user_id)
+            result = await self.db.participants.delete_one({
+                "message_id": str(payload.message_id),
+                "user_id": user_id
+            })
+            
+            # Update cache if participant was removed
+            if result.deleted_count > 0:
+                async with self._cache_lock:
+                    current = self._participant_cache.get(str(payload.message_id), 0)
+                    self._participant_cache[str(payload.message_id)] = max(0, current - 1)
+                    
+        except Exception as e:
+            self.logger.error(f"Error handling reaction remove: {e}")
 
     async def check_bot_permissions(self, channel):
         if not channel or not hasattr(channel, 'guild') or not channel.guild or not hasattr(channel, 'permissions_for'):
@@ -950,84 +948,6 @@ class GiveawayCog(commands.Cog):
             except Exception as e:
                 self.logger.error(f"Error in check_giveaways: {e}")
 
-    @tasks.loop(seconds=60)
-    async def update_button_counts(self):
-        """Update entry count buttons on active giveaways every 60 seconds.
-        Optimized for large servers with caching and batch processing.
-        Only updates messages when count actually changes to avoid rate limits."""
-        await self._ready.wait()
-        if not self.db.connected:
-            return
-        try:
-            active = await self.db.giveaways.find({"status": "active"}).to_list(length=None)
-            
-            # Batch process: Get all counts in one aggregation query (much faster)
-            bot_id = str(self.bot.user.id)
-            pipeline = [
-                {"$match": {"user_id": {"$ne": bot_id}}},
-                {"$group": {"_id": "$message_id", "count": {"$sum": 1}}}
-            ]
-            counts_result = await self.db.participants.aggregate(pipeline).to_list(length=None)
-            counts_map = {r['_id']: r['count'] for r in counts_result}
-            
-            # Update cache
-            async with self._cache_lock:
-                self._participant_cache = counts_map.copy()
-            
-            # Update messages (limit to 5 per cycle to avoid rate limits)
-            updates_this_cycle = 0
-            for gw in active:
-                if updates_this_cycle >= 5:
-                    break
-                    
-                try:
-                    mid = gw['message_id']
-                    total = counts_map.get(mid, 0)
-                    
-                    # Skip update if count hasn't changed since last update
-                    if mid in self._last_update_counts and self._last_update_counts[mid] == total:
-                        continue
-                    
-                    channel = self.bot.get_channel(gw['channel_id'])
-                    if not channel:
-                        continue
-                    
-                    try:
-                        message = await channel.fetch_message(int(mid))
-                    except (discord.NotFound, discord.HTTPException) as e:
-                        # If message not found, mark giveaway as error
-                        if isinstance(e, discord.NotFound):
-                            await self.db.giveaways.update_one(
-                                {"message_id": mid},
-                                {"$set": {"status": "error", "error": "Message deleted"}}
-                            )
-                        continue
-                    
-                    # Update view with new count
-                    view = GiveawayJoinView(mid, self.db, self)
-                    for item in view.children:
-                        if isinstance(item, ui.Button) and item.custom_id == "view_entries":
-                            item.label = str(total)
-                            break
-                    
-                    try:
-                        await message.edit(view=view)
-                        # Track this count to avoid future unnecessary updates
-                        self._last_update_counts[mid] = total
-                        updates_this_cycle += 1
-                        await asyncio.sleep(1.5)  # Longer delay between edits to respect rate limits
-                    except discord.HTTPException as e:
-                        if e.status == 429:  # Rate limited
-                            self.logger.warning(f"Rate limited while updating giveaway {mid}, skipping this cycle")
-                            break  # Stop updating this cycle
-                        else:
-                            raise
-                    
-                except Exception as msg_error:
-                    self.logger.error(f"Error updating button count for {gw.get('message_id', 'unknown')}: {msg_error}")
-        except Exception as e:
-            self.logger.error(f"Error in update_button_counts: {e}")
-
     @discord.app_commands.command(name="giveaway-start", description="Start a new giveaway")
     @discord.app_commands.guild_only()
     @discord.app_commands.default_permissions(administrator=True)
@@ -1092,8 +1012,21 @@ class GiveawayCog(commands.Cog):
             if interaction.guild and interaction.guild.icon:
                 embed.set_footer(text="made with ♡", icon_url=str(interaction.guild.icon))
 
-            view = GiveawayJoinView(str(0), self.db, self)  # Temporary message_id
+            # Create view for the giveaway
+            view = GiveawayJoinView(str(0), self.db, self)  # Temporary ID, will update
+            
+            # Send message with buttons
             msg = await interaction.channel.send(embed=embed, view=view)
+            
+            # Update view with actual message ID and register it
+            view.message_id = str(msg.id)
+            self.bot.add_view(view, message_id=msg.id)
+            
+            # Add reaction for users to join
+            try:
+                await msg.add_reaction(REACTION_EMOJI)
+            except Exception as e:
+                self.logger.error(f"Failed to add reaction: {e}")
 
             if self.db.connected:
                 await self.db.giveaways.insert_one({
@@ -1113,10 +1046,6 @@ class GiveawayCog(commands.Cog):
                 # Initialize cache for new giveaway
                 async with self._cache_lock:
                     self._participant_cache[str(msg.id)] = 0
-                
-                # Update view with correct message_id
-                view = GiveawayJoinView(str(msg.id), self.db, self)
-                await msg.edit(view=view)
                 
                 # Update statistics
                 if self.config.enable_statistics:
@@ -1237,9 +1166,36 @@ class GiveawayCog(commands.Cog):
             if chan.guild and chan.guild.icon:
                 embed.set_footer(text="made with ♡", icon_url=str(chan.guild.icon))
 
+            # Cancel any active fake reaction task
+            admin_cog = self.bot.get_cog("GiveawayAdminCog")
+            if admin_cog and message_id in admin_cog.active_fake_reaction_tasks:
+                admin_cog.active_fake_reaction_tasks[message_id].cancel()
+                try:
+                    await self.db.fake_reactions.update_one(
+                        {"message_id": message_id},
+                        {"$set": {
+                            "status": "cancelled",
+                            "cancelled_at": get_current_utc_timestamp()
+                        }}
+                    )
+                except Exception as db_error:
+                    self.logger.error(f"Error updating fake reaction status: {db_error}")
+
             view = GiveawayEndedView(total_participants, message_id, self.db, self.bot)
             
             await msg.edit(embed=embed, view=view)
+            
+            # Remove all reactions from the message
+            try:
+                await msg.clear_reactions()
+            except discord.Forbidden:
+                # If bot doesn't have permission to clear all reactions, try removing just the giveaway emoji
+                try:
+                    await msg.clear_reaction(REACTION_EMOJI)
+                except Exception as reaction_error:
+                    self.logger.error(f"Failed to remove reactions: {reaction_error}")
+            except Exception as reaction_error:
+                self.logger.error(f"Failed to clear reactions: {reaction_error}")
             
             # Update database first before sending reply
             try:
@@ -1253,11 +1209,6 @@ class GiveawayCog(commands.Cog):
                 )
             except Exception as db_error:
                 self.logger.error(f"Error updating giveaway status: {db_error}")
-            
-            # Clean up cache entry for ended giveaway
-            async with self._cache_lock:
-                self._participant_cache.pop(message_id, None)
-                self._last_update_counts.pop(message_id, None)
             
             # Update statistics
             if self.config.enable_statistics:
@@ -1276,10 +1227,6 @@ class GiveawayCog(commands.Cog):
                     await msg.reply(f"{REACTION_EMOJI} Congratulations {', '.join(mentions)}! You won **{gw['prize']}**!")
                 except Exception as reply_error:
                     self.logger.error(f"Error sending winner announcement: {reply_error}")
-            
-            # Clean up cache entry for ended giveaway
-            async with self._cache_lock:
-                self._participant_cache.pop(message_id, None)
 
         except Exception as e:
             self.logger.error(f"Error ending giveaway {message_id}: {e}")
@@ -1287,7 +1234,8 @@ class GiveawayCog(commands.Cog):
                 {"message_id": message_id},
                 {"$set": {"status": "error", "error": str(e)}}
             )
-            # Clean up cache even on error
+        finally:
+            # Clean up cache entry for ended giveaway (single cleanup point)
             async with self._cache_lock:
                 self._participant_cache.pop(message_id, None)
 
@@ -1346,10 +1294,24 @@ class GiveawayCog(commands.Cog):
             thumbnail_url = get_thumbnail_url(ctx.guild)
             if thumbnail_url:
                 embed.set_thumbnail(url=thumbnail_url)
-            embed.set_footer(icon_url=FOOTER_ICON_URL)
+            
+            if ctx.guild and ctx.guild.icon:
+                embed.set_footer(text="made with ♡", icon_url=str(ctx.guild.icon))
 
             view = GiveawayEndedView(total_participants, str(orig.id), self.db, self.bot)
             await orig.edit(embed=embed, view=view)
+            
+            # Remove all reactions from the message
+            try:
+                await orig.clear_reactions()
+            except discord.Forbidden:
+                # If bot doesn't have permission to clear all reactions, try removing just the giveaway emoji
+                try:
+                    await orig.clear_reaction(REACTION_EMOJI)
+                except Exception as reaction_error:
+                    self.logger.error(f"Failed to remove reactions: {reaction_error}")
+            except Exception as reaction_error:
+                self.logger.error(f"Failed to clear reactions: {reaction_error}")
 
             await self.db.giveaways.update_one(
                 {"message_id": str(orig.id)},
@@ -1507,8 +1469,21 @@ class GiveawayCog(commands.Cog):
             if ctx.guild and ctx.guild.icon:
                 embed.set_footer(text="made with ♡", icon_url=str(ctx.guild.icon))
 
-            view = GiveawayJoinView(str(0), self.db, self)
+            # Create view for the giveaway
+            view = GiveawayJoinView(str(0), self.db, self)  # Temporary ID, will update
+            
+            # Send message with buttons
             msg = await ctx.send(embed=embed, view=view)
+            
+            # Update view with actual message ID and register it
+            view.message_id = str(msg.id)
+            self.bot.add_view(view, message_id=msg.id)
+            
+            # Add reaction for users to join
+            try:
+                await msg.add_reaction(REACTION_EMOJI)
+            except Exception as e:
+                self.logger.error(f"Failed to add reaction: {e}")
             
             # Save to database
             if self.db.connected:
@@ -1527,10 +1502,6 @@ class GiveawayCog(commands.Cog):
                 # Initialize cache for new giveaway
                 async with self._cache_lock:
                     self._participant_cache[str(msg.id)] = 0
-                
-                # Update view with actual message_id
-                view.message_id = str(msg.id)
-                await msg.edit(view=view)
                 
                 self.logger.info(f"Giveaway started via prefix command by {ctx.author} in {ctx.guild.name}")
             

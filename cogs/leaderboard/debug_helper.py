@@ -280,6 +280,48 @@ class DebugCommands(commands.Cog):
         )
         
         await ctx.send(f"✅ Reset {period} stats for {result.modified_count} users")
+    
+    @commands.command(name='force_recreate_leaderboards')
+    @commands.has_permissions(administrator=True)
+    async def force_recreate_leaderboards(self, ctx: commands.Context, leaderboard_type: str = "all"):
+        """Force recreation of leaderboard embeds (chat/voice/all)"""
+        if not self.db:
+            await ctx.send("❌ Database not connected")
+            return
+        
+        if leaderboard_type not in ['chat', 'voice', 'all']:
+            await ctx.send("❌ Type must be: chat, voice, or all")
+            return
+        
+        await ctx.send(f"🔄 Forcing recreation of {leaderboard_type} leaderboard(s)...")
+        
+        try:
+            # Clear message IDs from database to force recreation
+            if leaderboard_type in ['chat', 'all']:
+                result = await self.db.leaderboard_messages.delete_one({
+                    'guild_id': ctx.guild.id,
+                    'type': 'chat'
+                })
+                if result.deleted_count > 0:
+                    await ctx.send("✅ Cleared chat leaderboard message IDs")
+                else:
+                    await ctx.send("ℹ️ No chat leaderboard message IDs found")
+            
+            if leaderboard_type in ['voice', 'all']:
+                result = await self.db.leaderboard_messages.delete_one({
+                    'guild_id': ctx.guild.id,
+                    'type': 'voice'
+                })
+                if result.deleted_count > 0:
+                    await ctx.send("✅ Cleared voice leaderboard message IDs")
+                else:
+                    await ctx.send("ℹ️ No voice leaderboard message IDs found")
+            
+            await ctx.send("✅ Leaderboards will be recreated in the next update cycle (within 5 minutes)")
+            
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
+            self.logger.error(f"Error forcing leaderboard recreation: {e}", exc_info=True)
 
 
 # Import asyncio for sleep
